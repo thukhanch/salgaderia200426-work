@@ -53,5 +53,5 @@
 
 ## DADOS DO ESTABELECIMENTO
 - Nome: Duzzi Salgados
-- Modalidade: somente retirada no balcão
-- Pagamento: somente no balcão na retirada
+- Consulte a configuração operacional carregada pelo sistema para dados variáveis do estabelecimento.
+- As regras fixas de retirada e pagamento são aplicadas pelo runtime central do agente.

@@ -1,0 +1,102 @@
+SALGADERIA TASK LOG
+Atualizado em 2026-04-21
+
+OBJETIVO GERAL
+- Limpar o runtime do agente da salgaderia sem abrir brechas, mantendo IA natural, contrato JSON estável, auditoria de prompt e testes offline controlados.
+
+FASE 1 - HIGIENE OPERACIONAL
+[ ] 1.1 Garantir que nenhuma instância de teste fique aberta ao final de cada ciclo
+[ ] 1.2 Validar que há no máximo uma instância ativa antes de cada teste
+[ ] 1.3 Encerrar a instância ao final de cada auditoria
+
+FASE 2 - AUDITORIA DE PROMPT
+[ ] 2.1 Auditar o prompt de sistema enviado ao modelo
+[ ] 2.1.1 Identificar duplicações entre script, schema e regras de decisão
+[ ] 2.1.2 Identificar blocos compactáveis sem perda de guardrail
+[ ] 2.1.3 Medir impacto de cada compactação no comportamento
+[ ] 2.2 Auditar o prompt de usuário enviado ao modelo
+[ ] 2.2.1 Verificar se há instruções desnecessárias ou repetidas
+[ ] 2.3 Auditar o reprocessamento
+[ ] 2.3.1 Verificar se o prompt de reparo está mínimo e seguro
+[ ] 2.4 Auditar logs de entrada e saída
+[ ] 2.4.1 Confirmar provider, baseUrl, modelo configurado e modelo efetivo retornado
+[ ] 2.4.2 Confirmar RAW/PARSED/FINAL output
+
+FASE 3 - REAÇÃO DO BACKEND
+[ ] 3.1 Auditar sanitização de reply
+[ ] 3.1.1 Garantir que guardrails corrijam vazamentos sem robotizar resposta boa
+[ ] 3.2 Auditar sanitização de toolCalls
+[ ] 3.3 Auditar normalização de memoryUpdates
+[ ] 3.4 Auditar confirmação de pedido
+[ ] 3.5 Auditar suppressão de handoff indevido
+
+FASE 4 - LIMPEZA DE CÓDIGO
+[ ] 4.1 Remover redundâncias entre script-atendimento e regras estruturais
+[ ] 4.2 Reduzir prompt sem remover proteções importantes
+[ ] 4.3 Centralizar qualquer texto solto restante em variáveis globais
+[ ] 4.4 Revisar arquivos afetados e anotar progresso
+
+FASE 5 - TESTES OFFLINE
+[ ] 5.1 Saudação simples
+[ ] 5.2 Quantidade inválida
+[ ] 5.3 Pergunta sobre PIX
+[ ] 5.4 Pedido parcial válido
+[ ] 5.5 Nome + resumo
+[ ] 5.6 Confirmação explícita
+[ ] 5.7 Caso de handoff legítimo
+
+PROGRESSO REGISTRADO
+[x] ai.service.ts reparado e build voltou a passar
+[x] 9router integrado com AI_BASE_URL/AI_API_KEY/AI_MODEL
+[x] endpoint de diagnóstico corrigido para mostrar provider 9router e modelConfigurado meucombo
+[x] logs de prompt system/user/raw/parsed/final habilitados
+[x] guardrail de saudação fixa removido para preservar resposta natural
+[x] duplicação estrutural do script-base removida do runtime
+[x] schema JSON compactado para linha única no prompt
+[x] ciclo de teste higienizado: porta validada antes de subir e instância encerrada ao final
+[x] auditoria confirmou provider 9router, modelConfigurado meucombo e modelo efetivo retornado gpt-5.4
+[x] auditoria confirmou que o backend preserva resposta boa e apenas normaliza quantidade=0 para null em memoryUpdates finais
+[x] redundâncias seguras identificadas entre script-atendimento.md e regras estruturais do prompt
+[x] 4 regras de domínio duplicadas foram removidas de SALGADERIA_AGENT_DECISION_RULES sem regressão nos cenários principais
+[x] após a redução, o prompt real manteve guardrails estruturais e os cenários de saudação, quantidade inválida, PIX e pedido parcial seguiram estáveis
+[x] etapa semântica aguardando_quantidade_valida foi adicionada à lista válida e deixou de ser rebaixada para inicio na reação final do backend
+[x] regressão offline completa executada em ciclo limpo e encerrada sem deixar instância aberta
+[x] cenários validados: saudação, quantidade inválida, PIX, pedido parcial, nome + resumo, confirmação explícita e handoff legítimo
+[x] auditoria final confirmou provider 9router, modelConfigurado meucombo e execução efetiva via backend local em todos os cenários testados
+[x] mensagem de lembrete do controller foi centralizada em buildReminderMessage()
+[x] descrição do evento do Google Calendar foi centralizada em buildCalendarEventDescription()
+[x] build passou após centralização adicional de textos operacionais
+[x] fallback de reparo "confirma?" foi centralizado em SALGADERIA_CONFIRMATION_STYLE
+[x] summary do evento do Google Calendar foi centralizado em buildCalendarEventSummary()
+[x] varredura dirigida final não encontrou novas sobras críticas de comportamento fora da configuração central
+[x] consolidação da base estável identificou um bug real em mergeDados(): dados novos da IA podiam ser ignorados pela preferência invertida de quantidade/data/horário
+[x] mergeDados() foi corrigido para priorizar campos novos saneados pela IA antes dos valores antigos
+[x] build passou após a correção da consolidação final
+[x] nova regressão offline foi iniciada após a consolidação para validar impacto prático do ajuste em mergeDados()
+[x] tentativa de subir a API com npm run start:dev falhou porque este projeto não expõe esse script no package.json
+[x] API foi subida com o script correto npm run dev e o diagnóstico confirmou provider=9router, baseUrl local e modelConfigurado=meucombo
+[x] a regressão offline encontrou um bug real no endpoint /api/salgaderia/simular: body.phone ausente gerava TypeError em processarMensagem()
+[x] endpoint /api/salgaderia/simular foi corrigido para aceitar ausência de phone com fallback local de teste
+[x] build passou após a correção do simulador
+[x] regressão offline completa foi reexecutada com sucesso: saudação, quantidade inválida, PIX, pedido parcial, nome + resumo, confirmação explícita e handoff legítimo
+[x] instância de teste foi encerrada ao final deste ciclo
+[x] revisão dos logs finais encontrou novo bug semântico: etapas válidas da IA ainda estavam incompletas e rebaixavam aguardando_nome, aguardando_confirmacao_final, handoff e pedido_confirmado para etapas antigas
+[x] SALGADERIA_ETAPAS_VALIDAS foi ampliada para preservar aguardando_nome, aguardando_confirmacao_final, handoff e pedido_confirmado
+[x] build passou após a correção da lista de etapas válidas
+[x] revalidação focada confirmou nos logs que o runtime preserva corretamente as etapas aguardando_nome, aguardando_confirmacao_final, pedido_confirmado e handoff
+[x] instância de teste da revalidação foi encerrada ao final do ciclo
+[x] varredura final de consistência no código central não encontrou novo bug estrutural aberto em ai.service.ts, salgaderia.service.ts ou salgaderia-agent.config.ts
+[x] pendências reais foram reduzidas a zero neste estado do runtime; o que resta agora são apenas refinamentos opcionais de naturalidade e limpeza futura
+[x] observações da varredura final: mergeDados está consistente, etapas válidas estão completas para o fluxo atual e o saneamento segue centralizado sem nova dispersão crítica
+
+PRÓXIMO PASSO SUGERIDO
+- Rodar uma validação curta dos cenários mais sensíveis de naturalidade para confirmar se o ajuste de estilo reduziu respostas longas desnecessárias sem mexer na estrutura estável.
+[x] RESUMO_COMPLETO_SALGADERIA.md foi atualizado para refletir o estado real consolidado do módulo, incluindo 9router, bugs corrigidos, cenários validados e fechamento técnico da fase
+[x] revisão final encontrou 2 shells residuais do ts-node-dev deixados abertos por engano após ciclos anteriores
+[x] shells residuais foram encerrados e higiene operacional voltou a ficar alinhada com a regra do projeto
+[x] próxima fase iniciada: refinamento opcional de naturalidade, sem reabrir mudanças estruturais já fechadas
+[x] regras de estilo ganharam reforço leve para resumo curto de confirmação e handoff mais direto
+[x] nova bateria de testes de estresse offline iniciada para observar resposta e comportamento da IA sob variedade e repetição de cenários
+[x] regressões de estresse corrigidas no runtime: override de PIX deixou de colapsar mensagens mistas, confirmação final passou a refletir pedido realmente criado e novas etapas semânticas de estresse foram preservadas
+[x] revalidação com 5 testes de estresse confirmou melhora prática: caso misto com PIX+quantidade inválida voltou a priorizar quantidade, handoff parcial ficou mais direto, confirmação explícita passou a responder como pedido confirmado e cenário misto com PIX+dado válido não colapsou mais para resposta só de PIX
+[x] após a revalidação, shells residuais do ts-node-dev foram identificados novamente e foram encerrados neste fechamento do ciclo

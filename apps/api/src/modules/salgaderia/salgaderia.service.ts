@@ -9,14 +9,23 @@ import { Cliente } from './entities/cliente.entity';
 import { Conversa } from './entities/conversa.entity';
 import { Pedido } from './entities/pedido.entity';
 import { Configuracao } from './entities/configuracao.entity';
-
-type ItemPedido = { sabor: string; tipo: string; quantidade: number };
-type BebidaPedido = { item: string; quantidade: number };
-
-type ToolCall = {
-  name: 'registrar_dados' | 'confirmar_pedido' | 'solicitar_handoff' | 'registrar_observacao';
-  arguments?: Record<string, any>;
-};
+import {
+  buildConfirmationReply,
+  buildOwnerHandoffMessage,
+  buildOwnerNewOrderMessage,
+  buildPromptSections,
+  hasCompleteOrderData,
+  normalizeEtapa,
+  SALGADERIA_CONFIG_DEFAULTS,
+  SALGADERIA_FIXED_CONFIG_DESCRIPTIONS,
+  SALGADERIA_OPERATIONAL_TEXT,
+  SALGADERIA_REGEX,
+  SalgaderiaToolCall,
+  shouldForceConfirmationReply,
+  shouldForceInvalidQuantityReply,
+  shouldForcePixReply,
+  shouldSuppressHandoff,
+} from './salgaderia-agent.config';
 
 @Injectable()
 export class SalgaderiaService implements OnModuleInit, OnModuleDestroy {
@@ -148,64 +157,25 @@ export class SalgaderiaService implements OnModuleInit, OnModuleDestroy {
     await this.conversaRepo.update(id, updates);
   }
 
-  private calcularValorTotalV4(dados: any): number {
-    const itens: ItemPedido[] = dados.itens || [];
-    const bebidas: BebidaPedido[] = dados.bebidas || [];
-
-    const itensFritos = itens.filter(i => i.tipo === 'frito');
-    const totalFritos = itensFritos.reduce((sum, i) => sum + Number(i.quantidade), 0);
-    const subtotalFritos = (totalFritos / 25) * 25;
-    const valorFritos = totalFritos >= 100 ? subtotalFritos * 0.9 : subtotalFritos;
-
-    const itensAssados = itens.filter(i => i.tipo === 'assado');
-    const totalAssados = itensAssados.reduce((sum, i) => sum + Number(i.quantidade), 0);
-    const subtotalAssados = (totalAssados / 10) * 25;
-    const valorAssados = totalAssados >= 50 ? subtotalAssados * 0.85 : subtotalAssados;
-
-    let valorBebidas = 0;
-    for (const b of bebidas) {
-      const q = Number(b.quantidade);
-      if (/coca/i.test(b.item)) valorBebidas += q * 18;
-      else if (/guaran/i.test(b.item)) valorBebidas += q * 15;
-    }
-
-    return parseFloat((valorFritos + valorAssados + valorBebidas).toFixed(2));
-  }
-
-  private mergeItens(itensAtuais: ItemPedido[] = [], itensNovos: ItemPedido[] = []) {
-    const merged = [...itensAtuais];
-
-    for (const itemNovo of itensNovos) {
-      if (!itemNovo?.sabor || !itemNovo?.tipo || !itemNovo?.quantidade) continue;
-      const idx = merged.findIndex(
-        (item) => item.sabor === itemNovo.sabor && item.tipo === itemNovo.tipo,
-      );
-      if (idx >= 0) merged[idx] = itemNovo;
-      else merged.push(itemNovo);
-    }
-
-    return merged;
-  }
-
-  private mergeBebidas(bebidasAtuais: BebidaPedido[] = [], bebidasNovas: BebidaPedido[] = []) {
-    const merged = [...bebidasAtuais];
-
-    for (const bebidaNova of bebidasNovas) {
-      if (!bebidaNova?.item || !bebidaNova?.quantidade) continue;
-      const idx = merged.findIndex((bebida) => bebida.item === bebidaNova.item);
-      if (idx >= 0) merged[idx] = bebidaNova;
-      else merged.push(bebidaNova);
-    }
-
-    return merged;
+  private calcularValorTotal(dados: Record<string, any>): number {
+    const quantidade = Number(dados.quantidade || 0);
+    return parseFloat(quantidade.toFixed(2));
   }
 
   private mergeDados(dadosAtuais: Record<string, any>, dadosNovos: Record<string, any>): Record<string, any> {
+    const quantidade = dadosNovos.quantidade ?? dadosAtuais.quantidade ?? null;
+    const dataAgendamento = dadosNovos.data_agendamento ?? dadosAtuais.data_agendamento ?? null;
+    const dataExibicao = dadosNovos.data_exibicao ?? dadosAtuais.data_exibicao ?? null;
+    const horarioAgendamento = dadosNovos.horario_agendamento ?? dadosAtuais.horario_agendamento ?? null;
+
     return {
       ...dadosAtuais,
       ...dadosNovos,
-      itens: this.mergeItens(dadosAtuais.itens || [], dadosNovos.itens || []),
-      bebidas: this.mergeBebidas(dadosAtuais.bebidas || [], dadosNovos.bebidas || []),
+      nome: dadosNovos.nome ?? dadosAtuais.nome ?? null,
+      quantidade,
+      data_agendamento: dataAgendamento,
+      data_exibicao: dataExibicao,
+      horario_agendamento: horarioAgendamento,
     };
   }
 
@@ -220,17 +190,12 @@ export class SalgaderiaService implements OnModuleInit, OnModuleDestroy {
 
   private construirResumoDadosConfirmados(dados: Record<string, any>) {
     const resumo: string[] = [];
-    const itens: ItemPedido[] = dados.itens || [];
-    const bebidas: BebidaPedido[] = dados.bebidas || [];
 
     if (dados.nome) resumo.push(`nome=${dados.nome}`);
-    if (itens.length) resumo.push(`itens=${itens.map((i) => `${i.sabor}:${i.quantidade}`).join(', ')}`);
-    if (bebidas.length) resumo.push(`bebidas=${bebidas.map((b) => `${b.item}:${b.quantidade}`).join(', ')}`);
+    if (dados.quantidade) resumo.push(`quantidade=${dados.quantidade}`);
     if (dados.data_agendamento) resumo.push(`data=${dados.data_agendamento}`);
+    if (dados.data_exibicao) resumo.push(`data_exibicao=${dados.data_exibicao}`);
     if (dados.horario_agendamento) resumo.push(`horario=${dados.horario_agendamento}`);
-    if (dados.tipo_entrega) resumo.push(`tipo_entrega=${dados.tipo_entrega}`);
-    if (dados.endereco) resumo.push(`endereco=${dados.endereco}`);
-    if (dados.pagamento) resumo.push(`pagamento=${dados.pagamento}`);
 
     return resumo;
   }
@@ -253,8 +218,8 @@ export class SalgaderiaService implements OnModuleInit, OnModuleDestroy {
       nomeCliente: dados.nome || cliente.name || null,
       resumoDadosConfirmados: this.construirResumoDadosConfirmados(dados),
       pendencias: this.construirPendencias(dados),
-      ultimoResumoPedido: (dados.itens || []).length
-        ? (dados.itens as ItemPedido[]).map((i) => `${i.sabor} (${i.quantidade})`).join(', ')
+      ultimoResumoPedido: dados.quantidade && dados.data_exibicao && dados.horario_agendamento
+        ? `${dados.quantidade} coxinhas para ${dados.data_exibicao} as ${dados.horario_agendamento}`
         : null,
     };
   }
@@ -266,9 +231,9 @@ export class SalgaderiaService implements OnModuleInit, OnModuleDestroy {
   gerarResumoProd(pedido: Pedido): string {
     return `PEDIDO #${pedido.id}\n`
       + `Tel: ${pedido.phone}\n`
-      + `Itens: ${pedido.item_escolhido} - ${pedido.quantidade} un. total\n`
-      + `Data: ${pedido.data_agendamento} as ${pedido.horario_agendamento}\n`
-      + `Entrega: ${pedido.tipo_entrega === 'entrega' ? `Entrega: ${pedido.endereco}` : 'Retirada'}\n`
+      + `Produto: ${pedido.item_escolhido}\n`
+      + `Quantidade: ${pedido.quantidade} un.\n`
+      + `Retirada: ${pedido.data_agendamento} as ${pedido.horario_agendamento}\n`
       + `Valor: R$ ${Number(pedido.valor_final).toFixed(2)}\n`
       + `Status: ${pedido.status}`;
   }
@@ -323,7 +288,7 @@ export class SalgaderiaService implements OnModuleInit, OnModuleDestroy {
       const donoWhatsapp = await this.getConfig('dono_whatsapp');
       if (donoWhatsapp) {
         const resumo = this.gerarResumoProd(pedidoConfirmado);
-        await this.whatsappService.sendMessage(sessionId, '+' + donoWhatsapp, `NOVO PEDIDO CONFIRMADO!\n\n${resumo}`);
+        await this.whatsappService.sendMessage(sessionId, '+' + donoWhatsapp, buildOwnerNewOrderMessage(resumo));
       }
     }
 
@@ -333,7 +298,7 @@ export class SalgaderiaService implements OnModuleInit, OnModuleDestroy {
         await this.whatsappService.sendMessage(
           sessionId,
           '+' + donoWhatsapp,
-          `HANDOFF NECESSARIO!\n\nCliente ${phone} precisa de atendimento humano.\n\nUltima mensagem: "${text}"`,
+          buildOwnerHandoffMessage(phone, text),
         );
       }
     }
@@ -342,7 +307,7 @@ export class SalgaderiaService implements OnModuleInit, OnModuleDestroy {
   }
 
   private async executarToolCalls(params: {
-    toolCalls: ToolCall[];
+    toolCalls: SalgaderiaToolCall[];
     dadosAtuais: Record<string, any>;
     dadosDaIa: Record<string, any>;
   }) {
@@ -375,29 +340,28 @@ export class SalgaderiaService implements OnModuleInit, OnModuleDestroy {
   }
 
   private async criarPedidoSePossivel(conversa: Conversa, dados: Record<string, any>) {
-    const itens: ItemPedido[] = dados.itens || [];
+    const quantidade = Number(dados.quantidade || 0);
     if (
-      itens.length === 0
+      !dados.nome
+      || !quantidade
+      || quantidade % 25 !== 0
       || !dados.data_agendamento
       || !dados.horario_agendamento
-      || !dados.tipo_entrega
     ) {
       return undefined;
     }
 
-    const valorTotal = this.calcularValorTotalV4(dados);
-    const totalQuantidade = itens.reduce((sum, i) => sum + Number(i.quantidade), 0);
-    const itemResumo = itens.map(i => `${i.sabor} (${i.quantidade})`).join(', ');
+    const valorTotal = this.calcularValorTotal(dados);
 
     const pedido = this.pedidoRepo.create({
       phone: conversa.phone,
       conversa_id: conversa.id,
-      item_escolhido: itemResumo,
-      quantidade: totalQuantidade,
+      item_escolhido: 'Coxinha',
+      quantidade,
       data_agendamento: dados.data_agendamento,
       horario_agendamento: dados.horario_agendamento,
-      tipo_entrega: dados.tipo_entrega,
-      endereco: dados.endereco || null,
+      tipo_entrega: SALGADERIA_OPERATIONAL_TEXT.tipoEntrega,
+      endereco: null,
       valor_final: valorTotal,
       status: 'confirmado',
     });
@@ -465,49 +429,58 @@ export class SalgaderiaService implements OnModuleInit, OnModuleDestroy {
     });
 
     const novosDados = toolRuntime.dadosAtualizados;
-    const novaEtapa = aiResult.memoryUpdates?.etapaAtual?.trim() || etapaAtual || 'inicio';
-    const novoHistorico = [
-      ...historico,
-      { role: 'user' as const, content: texto, timestamp: agora.toISOString() },
-      { role: 'assistant' as const, content: aiResult.replyToCustomer, timestamp: agora.toISOString() },
-    ].slice(-40);
+    const novaEtapa = normalizeEtapa(aiResult.memoryUpdates?.etapaAtual, normalizeEtapa(etapaAtual || 'inicio'));
 
     if (novosDados.nome && novosDados.nome !== cliente.name) {
       await this.clienteRepo.update(phoneNorm, { name: novosDados.nome });
     }
 
-    const confirmarPedido = Boolean(aiResult.shouldCreateOrder || toolRuntime.shouldCreateOrder);
-    const handoff = Boolean(aiResult.needsHuman || toolRuntime.handoff);
+    const confirmouExplicito = SALGADERIA_REGEX.explicitConfirmation.test(texto);
+    const dadosCompletos = hasCompleteOrderData(novosDados);
+    const confirmarPedido = Boolean(aiResult.shouldCreateOrder || toolRuntime.shouldCreateOrder || (confirmouExplicito && dadosCompletos));
+    const handoff = shouldSuppressHandoff(texto) ? false : Boolean(aiResult.needsHuman || toolRuntime.handoff);
+
+    let respostaFinal = aiResult.replyToCustomer;
+    if (shouldForcePixReply(texto, respostaFinal)) {
+      respostaFinal = SALGADERIA_OPERATIONAL_TEXT.pixReply;
+    } else if (shouldForceConfirmationReply(texto, novosDados, confirmarPedido)) {
+      respostaFinal = buildConfirmationReply(novosDados);
+    } else if (shouldForceInvalidQuantityReply(texto, respostaFinal)) {
+      respostaFinal = SALGADERIA_OPERATIONAL_TEXT.invalidQuantityReply;
+    }
+
     let pedidoConfirmado: Pedido | undefined;
 
     if (confirmarPedido) {
       pedidoConfirmado = await this.criarPedidoSePossivel(conversa, novosDados);
+      if (pedidoConfirmado) {
+        respostaFinal = `${buildConfirmationReply(novosDados).replace(/\s*-\s*confirma\?$/i, '')}. ${SALGADERIA_OPERATIONAL_TEXT.confirmedOrderReplySuffix}`;
+      }
     }
 
+    const historicoFinal = [
+      ...historico,
+      { role: 'user' as const, content: texto, timestamp: agora.toISOString() },
+      { role: 'assistant' as const, content: respostaFinal, timestamp: agora.toISOString() },
+    ].slice(-40);
+
     await this.updateConversa(conversa.id, {
-      etapa_atual: confirmarPedido ? 'finalizado' : (novaEtapa as any),
+      etapa_atual: confirmarPedido ? 'finalizado' : novaEtapa,
       dados_parciais: novosDados,
       pedido_em_aberto: !confirmarPedido,
-      historico_mensagens: novoHistorico,
+      historico_mensagens: historicoFinal,
       ultima_interacao: agora,
     });
 
     return {
-      resposta: aiResult.replyToCustomer,
+      resposta: respostaFinal,
       handoff,
       pedidoConfirmado,
     };
   }
 
   private async garantirConfiguracoesAtendimento() {
-    const defaults = [
-      ['chave_pix', '', 'Chave PIX do estabelecimento'],
-      ['endereco_salgaderia', '', 'Endereco da salgaderia'],
-      ['telefone_responsavel', '', 'Telefone do responsavel humano'],
-      ['valor_frete_padrao', '0', 'Valor padrao do frete por bairro/regiao'],
-    ];
-
-    for (const [chave, valor, descricao] of defaults) {
+    for (const [chave, valor, descricao] of SALGADERIA_CONFIG_DEFAULTS) {
       await this.configRepo
         .createQueryBuilder()
         .insert()
@@ -516,6 +489,18 @@ export class SalgaderiaService implements OnModuleInit, OnModuleDestroy {
         .orIgnore()
         .execute();
     }
+  }
+
+  async gerarDiagnosticoPrompt() {
+    await this.loadConfig();
+    const aiRuntime = this.aiService as any;
+    const systemPrompt = aiRuntime.buildSystemPrompt(this.config);
+    return {
+      provider: process.env.AI_BASE_URL ? '9router' : 'openrouter',
+      baseUrl: (process.env.AI_BASE_URL || 'https://openrouter.ai/api/v1').replace(/\/$/, ''),
+      modelConfigurado: process.env.AI_MODEL || process.env.OPENROUTER_MODEL || 'openrouter/auto',
+      promptSections: buildPromptSections(systemPrompt, this.config),
+    };
   }
 
   async loadConfig() {
@@ -532,7 +517,7 @@ export class SalgaderiaService implements OnModuleInit, OnModuleDestroy {
       .createQueryBuilder()
       .insert()
       .into(Configuracao)
-      .values({ chave, valor, descricao: chave === 'whatsapp_session_id' ? 'Sessao WhatsApp ativa da salgaderia' : null })
+      .values({ chave, valor, descricao: SALGADERIA_FIXED_CONFIG_DESCRIPTIONS[chave] ?? null })
       .orUpdate(['valor'], ['chave'])
       .execute();
 

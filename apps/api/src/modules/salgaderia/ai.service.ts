@@ -2,6 +2,36 @@ import { Injectable, Logger } from '@nestjs/common';
 import axios from 'axios';
 import * as fs from 'fs';
 import * as path from 'path';
+import {
+  buildConfirmationReply,
+  buildOrderSummaryParts,
+  buildPromptSections,
+  buildReprocessSystemPrompt,
+  buildRuntimePrompt,
+  isBadReplyPayload,
+  isGreetingReply,
+  normalizeEtapa,
+  normalizeNeedsHuman,
+  normalizeNome,
+  normalizePendencias,
+  normalizeResumoInterno,
+  normalizeShouldCreateOrder,
+  normalizeToolArguments,
+  SALGADERIA_CONFIRMATION_STYLE,
+  SALGADERIA_MODEL_PREFERENCES,
+  SALGADERIA_OPERATIONAL_TEXT,
+  SALGADERIA_PRIMARY_BEHAVIOR,
+  SALGADERIA_REGEX,
+  SALGADERIA_REPROCESS_BEHAVIOR,
+  SALGADERIA_REPLY_STYLE_BLOCKLIST,
+  SALGADERIA_SYSTEM_REMINDERS,
+  SALGADERIA_TOOL_NAMES,
+  sanitizeAgentReplyText,
+  SalgaderiaToolCall,
+  SalgaderiaToolName,
+  shouldDropForbiddenOrderFields,
+  shouldAllowNeedsHuman,
+} from './salgaderia-agent.config';
 
 type AtendimentoState = {
   etapaAtual: string;
@@ -21,20 +51,9 @@ type AtendimentoState = {
   };
 };
 
-type ToolCallName =
-  | 'registrar_dados'
-  | 'confirmar_pedido'
-  | 'solicitar_handoff'
-  | 'registrar_observacao';
-
-type ToolCall = {
-  name: ToolCallName;
-  arguments?: Record<string, any>;
-};
-
 export type AtendimentoAiResult = {
   replyToCustomer: string;
-  toolCalls: ToolCall[];
+  toolCalls: SalgaderiaToolCall[];
   memoryUpdates: {
     etapaAtual?: string | null;
     dados?: Record<string, any>;
@@ -48,248 +67,528 @@ export type AtendimentoAiResult = {
 @Injectable()
 export class AiService {
   private readonly logger = new Logger(AiService.name);
-  private readonly apiKey = process.env.OPENROUTER_API_KEY;
-  private readonly model = process.env.OPENROUTER_MODEL || 'openrouter/free';
-  private readonly baseUrl = 'https://openrouter.ai/api/v1/chat/completions';
+  private readonly apiKey = process.env.AI_API_KEY || process.env.OPENROUTER_API_KEY;
+  private readonly model = process.env.AI_MODEL || process.env.OPENROUTER_MODEL || SALGADERIA_MODEL_PREFERENCES.fallbackModel;
+  private readonly baseUrl = (process.env.AI_BASE_URL || 'https://openrouter.ai/api/v1').replace(/\/$/, '') + '/chat/completions';
+  private readonly providerLabel = process.env.AI_BASE_URL ? 'AI backend' : 'OpenRouter';
+  private readonly shouldSendOpenRouterHeaders = !process.env.AI_BASE_URL;
 
-  private readonly responseStylePrompt = [
-    'VOCE E O ATENDENTE VIRTUAL DA DUZZI SALGADOS.',
-    'Voce nao tem nome proprio. Nunca diga seu nome. Nunca confunda o nome do cliente com o seu.',
-    'Seu trabalho e interpretar a mensagem, decidir o que fazer e produzir uma resposta natural ao cliente.',
-    'Voce NAO e um bot de fluxo fixo, NAO usa respostas prontas e NAO depende de saudacoes programadas.',
-    'Voce pode decidir responder, registrar memoria operacional, confirmar pedido ou pedir handoff humano.',
-    'O backend executa ferramentas; voce apenas solicita acoes estruturadas quando necessario.',
-    'Use historico, dados persistidos e memoria operacional para evitar repeticoes e perguntas desnecessarias.',
-    'Nunca invente status internos, disponibilidade fora da base ou dados nao informados.',
-    'Se faltar contexto, conduza naturalmente a conversa para obter o minimo necessario.',
-    'Se o cliente apenas cumprimentar, responda ao cumprimento e convide a pessoa a dizer o que deseja.',
-    'Quando o cliente quiser apenas tirar duvida, responda com base na base de conhecimento e nao force fechamento.',
-    'A mensagem ao cliente deve ser uma unica resposta natural, humana e objetiva.',
-    'IMPORTANTE: So existe UM produto: Coxinha, R$ 1,00 cada, minimo 25, multiplos de 25.',
-    'IMPORTANTE: So existe retirada no balcao. Nao ha entrega, frete ou motoboy.',
-    'IMPORTANTE: Pagamento apenas no balcao na retirada. Nao ha PIX nem pagamento antecipado.',
-    'IMPORTANTE: Se o cliente pedir quantidade invalida, recuse gentilmente e proponha os multiplos de 25 mais proximos.',
-    'IMPORTANTE: Antes de registrar o pedido, faca um resumo completo com quantidade, data e horario, e peca confirmacao explicita. Exemplo: Eduardo, 50 coxinhas para amanha 21/04 as 18h - confirma?',
-    'IMPORTANTE: Nunca mencione pagamento na conversa. O cliente ja sabe que paga no balcao na retirada.',
-    'IMPORTANTE: Na saudacao inicial, sempre se apresente como atendimento da Duzzi Salgados e pergunte como pode ajudar.',
-  ].join(String.fromCharCode(10));
+  private buildRequestHeaders() {
+    const headers: Record<string, string> = {
+      Authorization: `Bearer ${this.apiKey}`,
+      'Content-Type': 'application/json',
+    };
 
-  private readonly outputSchemaPrompt = `INSTRUCAO CRITICA: sua resposta deve comecar com { e terminar com }. Nenhum texto fora do JSON. Responda EXCLUSIVAMENTE em JSON valido, sem texto adicional, neste formato:
-{
-  "replyToCustomer": "texto unico para o cliente",
-  "toolCalls": [
-    {
-      "name": "registrar_dados",
-      "arguments": {}
+    if (this.shouldSendOpenRouterHeaders) {
+      headers['HTTP-Referer'] = 'http://localhost:3000';
+      headers['X-Title'] = 'Whatsapp Flow Salgaderia';
     }
-  ],
-  "availableToolNames": ["registrar_dados", "confirmar_pedido", "solicitar_handoff", "registrar_observacao"],
-  "memoryUpdates": {
-    "etapaAtual": "texto curto ou null",
-    "dados": {
-      "nome": "string ou null",
-      "quantidade": 0,
-      "data_agendamento": "YYYY-MM-DD ou null",
-      "data_exibicao": "DD/MM/YYYY ou null",
-      "horario_agendamento": "HH:MM ou null"
-    },
-    "pendencias": ["lista curta do que ainda falta"],
-    "resumoInterno": "resumo operacional curto ou null"
-  },
-  "needsHuman": false,
-  "shouldCreateOrder": false
-}
 
-REGRAS:
-- So existe um produto: Coxinha. Nao registre outros produtos.
-- Quantidade deve ser multiplo de 25. Se nao for, recuse gentilmente e proponha o multiplo mais proximo.
-- Modalidade e sempre retirada no balcao. Nao registre entrega, endereco ou frete.
-- Pagamento e sempre no balcao na retirada. Nao registre forma de pagamento.
-- Preencha memoryUpdates.dados APENAS com fatos confirmados pelo cliente.
-- Quando o cliente disser hoje, amanha ou depois de amanha, converta para datas absolutas.
-- Se a mensagem for apenas saudacao, nao preencha dados de pedido e deixe pendencias vazias.
-- Use shouldCreateOrder=true SOMENTE quando o cliente confirmar explicitamente o pedido final.
-- Use solicitar_handoff e needsHuman=true SOMENTE quando realmente precisar escalar para humano.
-- Nao escreva explicacoes fora do JSON.
-- A resposta ao cliente nao pode ser vazia.`;
+    return headers;
+  }
 
-    async responderMensagem(message: string, state: AtendimentoState): Promise<AtendimentoAiResult> {
+  private buildReprocessHeaders() {
+    const headers: Record<string, string> = {
+      Authorization: `Bearer ${this.apiKey}`,
+      'Content-Type': 'application/json',
+    };
+
+    if (this.shouldSendOpenRouterHeaders) {
+      headers['HTTP-Referer'] = 'http://localhost:3000';
+      headers['X-Title'] = 'Duzzi Salgados';
+    }
+
+    return headers;
+  }
+
+  private logProviderConfiguration() {
+    this.logger.log(`${this.providerLabel} endpoint: ${this.baseUrl}`);
+    this.logger.log(`${this.providerLabel} model: ${this.model}`);
+  }
+
+  private logPromptAudit(systemContent: string, userContent: string) {
+    this.logger.log(`PROMPT SYSTEM >>> ${systemContent}`);
+    this.logger.log(`PROMPT USER >>> ${userContent}`);
+  }
+
+  private logOutputAudit(content: string, parsed: unknown) {
+    this.logger.log(`PROMPT RAW OUTPUT >>> ${content}`);
+    this.logger.log(`PROMPT PARSED OUTPUT >>> ${JSON.stringify(parsed)}`);
+  }
+
+  private logFinalAudit(result: AtendimentoAiResult) {
+    this.logger.log(`PROMPT FINAL OUTPUT >>> ${JSON.stringify(result)}`);
+  }
+
+  private logPromptWarnings() {
+    if (this.model === SALGADERIA_MODEL_PREFERENCES.discouragedAutoModel) {
+      this.logger.warn(SALGADERIA_OPERATIONAL_TEXT.modelAutoWarning);
+    }
+  }
+
+  private trimPayloadForLog(text: string) {
+    return text.length > 12000 ? `${text.slice(0, 12000)}...[truncated]` : text;
+  }
+
+  private logAuditSnapshot(systemContent: string, userContent: string) {
+    this.logProviderConfiguration();
+    this.logPromptWarnings();
+    this.logPromptAudit(this.trimPayloadForLog(systemContent), this.trimPayloadForLog(userContent));
+  }
+
+  private logModelSelection() {
+    this.logProviderConfiguration();
+    this.logPromptWarnings();
+  }
+
+  private ensureApiConfiguration() {
     if (!this.apiKey) {
-      throw new Error('OPENROUTER_API_KEY nao configurada');
+      throw new Error('AI_API_KEY/OPENROUTER_API_KEY nao configurada');
+    }
+  }
+
+  private getUserPrompt(userMessage: string) {
+    return [
+      'Mensagem real do cliente:',
+      userMessage || '(vazia)',
+      'Responda com naturalidade e devolva somente o JSON do schema.',
+    ].join('\n');
+  }
+
+  private buildChatMessages(systemContent: string, userPrompt: string) {
+    return [
+      { role: 'system' as const, content: systemContent },
+      { role: 'user' as const, content: userPrompt },
+    ];
+  }
+
+  private buildMainRequestBody(chatMessages: Array<{ role: 'system' | 'user' | 'assistant'; content: string }>) {
+    return {
+      model: this.model,
+      temperature: SALGADERIA_PRIMARY_BEHAVIOR.temperature,
+      messages: chatMessages,
+    };
+  }
+
+  private buildReprocessRequestBody(content: string, hojeIso: string) {
+    return {
+      model: this.model,
+      temperature: SALGADERIA_REPROCESS_BEHAVIOR.lowTemperature,
+      messages: [
+        {
+          role: 'system' as const,
+          content: buildReprocessSystemPrompt(hojeIso),
+        },
+        {
+          role: 'user' as const,
+          content: `Converta para JSON: "${content}"`,
+        },
+      ],
+    };
+  }
+
+  private buildAxiosConfig(headers: Record<string, string>, timeout: number) {
+    return { headers, timeout };
+  }
+
+  private buildFallbackParsed(replyToCustomer: string) {
+    return {
+      replyToCustomer,
+      toolCalls: [],
+      memoryUpdates: {},
+      needsHuman: false,
+      shouldCreateOrder: false,
+    };
+  }
+
+  private defaultParsedFallback() {
+    return {
+      replyToCustomer: SALGADERIA_OPERATIONAL_TEXT.fallbackReply,
+      toolCalls: [],
+      memoryUpdates: {},
+      needsHuman: false,
+      shouldCreateOrder: false,
+    };
+  }
+
+  private coerceNonJsonToSchema(rawRecoveredReply: string) {
+    return JSON.stringify(this.buildFallbackParsed(rawRecoveredReply));
+  }
+
+  private parseContent(content: string) {
+    const repairJson = (raw: string): string => {
+      let out = '';
+      let inString = false;
+      for (let i = 0; i < raw.length; i++) {
+        const ch = raw[i];
+        const prev = i > 0 ? raw[i - 1] : '';
+        if (ch === '"' && prev !== '\\') inString = !inString;
+        else if (inString && (ch === '\n' || ch === '\r')) {
+          out += '\\n';
+          continue;
+        }
+        out += ch;
+      }
+      return out;
+    };
+
+    const extractJsonCandidate = (raw: string) => {
+      const trimmed = raw.trim();
+      const firstBrace = trimmed.indexOf('{');
+      const lastBrace = trimmed.lastIndexOf('}');
+      if (firstBrace >= 0 && lastBrace > firstBrace) {
+        return trimmed.slice(firstBrace, lastBrace + 1);
+      }
+      return trimmed;
+    };
+
+    return JSON.parse(repairJson(extractJsonCandidate(content)));
+  }
+
+  private applyParsedNormalization(parsed: any, state: AtendimentoState, userMessage: string) {
+    parsed.replyToCustomer = this.normalizeReplyToCustomer(parsed.replyToCustomer);
+    parsed.memoryUpdates = this.normalizeMemoryUpdates(parsed.memoryUpdates, state);
+    parsed.toolCalls = this.sanitizeToolCalls(parsed.toolCalls || []);
+    parsed.needsHuman = this.resolveNeedsHuman(parsed.needsHuman, userMessage);
+    parsed.shouldCreateOrder = normalizeShouldCreateOrder(parsed.shouldCreateOrder);
+
+    if (!parsed.memoryUpdates) parsed.memoryUpdates = {};
+    if (!parsed.toolCalls) parsed.toolCalls = [];
+    if (parsed.dados) {
+      parsed.memoryUpdates.dados = parsed.dados;
+      delete parsed.dados;
     }
 
-    const systemPrompt = this.buildSystemPrompt(state.config);
-    const hoje = new Date();
-    const hojeIso = hoje.toISOString().slice(0, 10);
+    return parsed;
+  }
 
+  private normalizeResponseContent(content: string) {
+    return content.replace(/^```\w*\s*/i, '').replace(/```\s*$/i, '').trim().replace(/\\_/g, '_');
+  }
+
+  private sanitizeParsedResult(parsed: AtendimentoAiResult, state: AtendimentoState) {
+    const result = this.sanitizeAiResult(parsed, state);
+    this.logFinalAudit(result);
+    return result;
+  }
+
+  private fetchContent = async (body: any, headers: Record<string, string>, timeout: number) => {
+    const response = await axios.post(this.baseUrl, body, this.buildAxiosConfig(headers, timeout));
+    this.logger.log(`${this.providerLabel} full response: ${JSON.stringify(response.data)}`);
+    return response.data?.choices?.[0]?.message?.content;
+  };
+
+  private normalizePromptBlocks(systemContent: string, userPrompt: string) {
+    return {
+      systemContent: this.trimPayloadForLog(systemContent),
+      userPrompt: this.trimPayloadForLog(userPrompt),
+    };
+  }
+
+  private getSystemContent(state: AtendimentoState, systemPrompt: string, hojeIso: string, userMessage: string, historicoRecente: string) {
     const contextMsg = [
-      `Canal: WhatsApp`,
-      `Data atual de referencia: ${hojeIso}`,
-      `Telefone do cliente: ${state.clientePhone}`,
-      `Marcador operacional atual: ${state.etapaAtual || 'sem marcador'}`,
-      `Dados confirmados persistidos: ${JSON.stringify(state.dados || {})}`,
+      `Data atual: ${hojeIso}`,
+      `Cliente: ${state.clientePhone}`,
+      `Etapa: ${state.etapaAtual || 'sem marcador'}`,
+      `Dados persistidos: ${JSON.stringify(state.dados || {})}`,
+      `Memoria operacional: ${JSON.stringify(state.memoriaOperacional || {})}`,
+      'Use esse contexto apenas para decidir. Nunca repita esse bloco ao cliente.',
     ].join('\n');
 
-    const memoryMsg = [
-      'MEMORIA OPERACIONAL:',
-      JSON.stringify(state.memoriaOperacional || {}, null, 2),
-    ].join('\n');
+    return [
+      ...buildPromptSections(systemPrompt, state.config),
+      contextMsg,
+      SALGADERIA_SYSTEM_REMINDERS.recentHistory,
+      historicoRecente || 'primeira mensagem',
+      `${SALGADERIA_SYSTEM_REMINDERS.latestMessagePriority} ${userMessage || '(vazia)'}`,
+    ].join('\n\n');
+  }
 
-    const toolMsg = [
-      'FERRAMENTAS DISPONIVEIS:',
-      '- registrar_dados: pedir ao backend para persistir dados confirmados',
-      '- confirmar_pedido: pedir ao backend para criar o pedido quando o cliente ja confirmou o resumo final',
-      '- solicitar_handoff: pedir escalada para humano',
-      '- registrar_observacao: guardar uma nota operacional curta sem efeito externo',
-    ].join('\n');
-
-    const latestUserTurnMsg = `ULTIMA MENSAGEM DO CLIENTE (prioridade maxima): ${message}`;
-
-    const dadosResumo = state.dados ? Object.entries(state.dados)
-      .filter(([, v]) => v !== null && v !== undefined && v !== '')
-      .map(([k, v]) => `${k}=${v}`).join(', ') : '';
-
-    const historicoRecente = state.historico.slice(-6)
+  private getRecentHistory(state: AtendimentoState) {
+    return state.historico.slice(-6)
       .map(m => `${m.role === 'user' ? 'Cliente' : 'Atendente'}: ${m.content}`)
       .join('\n');
+  }
 
-    const systemContent = `DUZZI SALGADOS - Atendente Virtual
-PRODUTO: Coxinha R$1,00/cada. Minimo 25. Multiplos de 25 (25,50,75,100...).
-MODALIDADE: Somente retirada no balcao. SEM entrega. SEM frete.
-PAGAMENTO: Somente no balcao na retirada. SEM PIX. SEM antecipado.
-DADOS JA COLETADOS: ${dadosResumo || 'nenhum'}
-HISTORICO RECENTE:
-${historicoRecente || 'primeira mensagem'}
-ULTIMA MENSAGEM: ${message}
-INSTRUCAO: Responda naturalmente como atendente. Se quantidade invalida, recuse e proponha multiplo de 25. Nunca mencione pagamento. Faca resumo e peca confirmacao antes de fechar pedido.
-FORMATO: Responda APENAS em JSON: {"replyToCustomer":"texto","needsHuman":false,"shouldCreateOrder":false,"dados":{"nome":null,"quantidade":null,"data_agendamento":null,"horario_agendamento":null}}`;
+  private parseOrFallback(content: string, rawRecoveredReply: string) {
+    try {
+      return this.parseContent(content);
+    } catch {
+      return this.defaultParsedFallback();
+    }
+  }
 
-    const chatMessages: Array<{ role: 'system' | 'user' | 'assistant'; content: string }> = [
-      { role: 'system', content: systemContent },
-      { role: 'user', content: message },
-    ];
+  private ensureJsonEnvelope(content: string, rawRecoveredReply: string) {
+    if (!content.trim().startsWith('{')) {
+      return this.coerceNonJsonToSchema(rawRecoveredReply);
+    }
+    return content;
+  }
+
+  private shouldReprocessContent(content: string, rawRecoveredReply: string) {
+    return !content.trim().startsWith('{') || this.isInvalidRecoveredReply(rawRecoveredReply);
+  }
+
+  private async maybeReprocessContent(content: string, hojeIso: string) {
+    const reprocessed = await this.fetchContent(
+      this.buildReprocessRequestBody(content, hojeIso),
+      this.buildReprocessHeaders(),
+      30000,
+    );
+    return this.normalizeResponseContent(reprocessed || content);
+  }
+
+  private logContentStages(content: string, parsed: unknown) {
+    this.logOutputAudit(this.trimPayloadForLog(content), parsed);
+  }
+
+  private normalizeIncomingContent(content: string | undefined) {
+    if (!content) {
+      throw new Error(`${this.providerLabel} retornou resposta vazia`);
+    }
+    return this.normalizeResponseContent(content);
+  }
+
+  private getSystemPrompt(config: Record<string, string>) {
+    return this.buildSystemPrompt(config);
+  }
+
+  private getCurrentDateIso() {
+    return new Date().toISOString().slice(0, 10);
+  }
+
+  private getTrimmedUserMessage(message: string) {
+    return typeof message === 'string' ? message.trim() : '';
+  }
+
+  private buildAuditReadyPrompts(state: AtendimentoState, message: string) {
+    const systemPrompt = this.getSystemPrompt(state.config);
+    const hojeIso = this.getCurrentDateIso();
+    const historicoRecente = this.getRecentHistory(state);
+    const userMessage = this.getTrimmedUserMessage(message);
+    const systemContent = this.getSystemContent(state, systemPrompt, hojeIso, userMessage, historicoRecente);
+    const userPrompt = this.getUserPrompt(userMessage);
+    return { systemPrompt, hojeIso, historicoRecente, userMessage, systemContent, userPrompt };
+  }
+
+  private getPromptDiagnostics(state: AtendimentoState, message: string) {
+    const { systemContent, userPrompt } = this.buildAuditReadyPrompts(state, message);
+    return this.normalizePromptBlocks(systemContent, userPrompt);
+  }
+
+  private buildMainChatPayload(state: AtendimentoState, message: string) {
+    const { hojeIso, userMessage, systemContent, userPrompt } = this.buildAuditReadyPrompts(state, message);
+    this.logAuditSnapshot(systemContent, userPrompt);
+    return {
+      hojeIso,
+      userMessage,
+      systemContent,
+      userPrompt,
+      chatMessages: this.buildChatMessages(systemContent, userPrompt),
+    };
+  }
+
+  private buildPromptAuditResult(state: AtendimentoState, message: string) {
+    return this.getPromptDiagnostics(state, message);
+  }
+
+  private logPromptAuditFromState(state: AtendimentoState, message: string) {
+    const audit = this.buildPromptAuditResult(state, message);
+    this.logPromptAudit(audit.systemContent, audit.userPrompt);
+  }
+
+  private getProviderLabel() {
+    return this.providerLabel;
+  }
+
+  private getBaseUrl() {
+    return this.baseUrl;
+  }
+
+  private getModel() {
+    return this.model;
+  }
+
+  private getHeaders() {
+    return this.buildRequestHeaders();
+  }
+
+  private getReprocessHeaders() {
+    return this.buildReprocessHeaders();
+  }
+
+  private getApiKey() {
+    return this.apiKey;
+  }
+
+  private getShouldSendOpenRouterHeaders() {
+    return this.shouldSendOpenRouterHeaders;
+  }
+
+  private getMainTemperature() {
+    return SALGADERIA_PRIMARY_BEHAVIOR.temperature;
+  }
+
+  private getReprocessTemperature() {
+    return SALGADERIA_REPROCESS_BEHAVIOR.lowTemperature;
+  }
+
+  private getModelPreferenceWarning() {
+    return SALGADERIA_OPERATIONAL_TEXT.modelAutoWarning;
+  }
+
+  private getModelPreference() {
+    return SALGADERIA_MODEL_PREFERENCES;
+  }
+
+  private getReplyStyleBlocklist() {
+    return SALGADERIA_REPLY_STYLE_BLOCKLIST;
+  }
+
+  private getSystemReminders() {
+    return SALGADERIA_SYSTEM_REMINDERS;
+  }
+
+  private getRegex() {
+    return SALGADERIA_REGEX;
+  }
+
+  private getOperationalText() {
+    return SALGADERIA_OPERATIONAL_TEXT;
+  }
+
+  private getPromptSections(systemPrompt: string, config: Record<string, string>) {
+    return buildPromptSections(systemPrompt, config);
+  }
+
+  private getRuntimePrompt(baseScript: string, config: Record<string, string>) {
+    return buildRuntimePrompt(baseScript, config);
+  }
+
+  private getReprocessPrompt(hojeIso: string) {
+    return buildReprocessSystemPrompt(hojeIso);
+  }
+
+  private getOrderSummaryParts(dados: Record<string, any>) {
+    return buildOrderSummaryParts(dados);
+  }
+
+  private getConfirmationReply(dados: Record<string, any>) {
+    return buildConfirmationReply(dados);
+  }
+
+  private getToolNames() {
+    return SALGADERIA_TOOL_NAMES;
+  }
+
+  private getPromptAuditSnapshot(state: AtendimentoState, message: string) {
+    return this.buildPromptAuditResult(state, message);
+  }
+
+  private getPromptAuditLog(state: AtendimentoState, message: string) {
+    return this.getPromptAuditSnapshot(state, message);
+  }
+
+  private getPromptAuditSystem(state: AtendimentoState, message: string) {
+    return this.getPromptAuditSnapshot(state, message).systemContent;
+  }
+
+  private getPromptAuditUser(state: AtendimentoState, message: string) {
+    return this.getPromptAuditSnapshot(state, message).userPrompt;
+  }
+
+  private getPromptAuditProvider() {
+    return {
+      providerLabel: this.getProviderLabel(),
+      baseUrl: this.getBaseUrl(),
+      model: this.getModel(),
+      sendsOpenRouterHeaders: this.getShouldSendOpenRouterHeaders(),
+    };
+  }
+
+  private getPromptAuditComposite(state: AtendimentoState, message: string) {
+    return {
+      ...this.getPromptAuditProvider(),
+      ...this.getPromptAuditSnapshot(state, message),
+    };
+  }
+
+  private validateProvider() {
+    this.ensureApiConfiguration();
+  }
+
+  async responderMensagem(message: string, state: AtendimentoState): Promise<AtendimentoAiResult> {
+    this.validateProvider();
+
+    const { hojeIso, userMessage, chatMessages } = this.buildMainChatPayload(state, message);
 
     try {
-      const response = await axios.post(
-        this.baseUrl,
-        {
-          model: this.model,
-          temperature: 0.4,
-          messages: chatMessages,
-        },
-        {
-          headers: {
-            Authorization: `Bearer ${this.apiKey}`,
-            'Content-Type': 'application/json',
-            'HTTP-Referer': 'http://localhost:3000',
-            'X-Title': 'Whatsapp Flow Salgaderia',
-          },
-          timeout: 45000,
-        },
+      let content = await this.fetchContent(
+        this.buildMainRequestBody(chatMessages),
+        this.buildRequestHeaders(),
+        45000,
       );
 
-      this.logger.log(`OpenRouter full response: ${JSON.stringify(response.data)}`);
-      let content = response.data?.choices?.[0]?.message?.content;
-      this.logger.log(`OpenRouter raw response: ${content}`);
+      content = this.normalizeIncomingContent(content);
+      const rawRecoveredReply = this.normalizeReplyToCustomer(content);
 
-      if (!content) {
-        throw new Error('OpenRouter retornou resposta vazia');
+      if (this.shouldReprocessContent(content, rawRecoveredReply)) {
+        this.logger.log('Resposta invalida para consumo direto, reprocessando...');
+        content = await this.maybeReprocessContent(content, hojeIso);
       }
 
-      content = content.replace(/^```\w*\s*/i, '').replace(/```\s*$/i, '').trim();
+      content = this.ensureJsonEnvelope(content, rawRecoveredReply);
+      let parsed = this.parseOrFallback(content, rawRecoveredReply);
+      parsed = this.applyParsedNormalization(parsed, state, userMessage);
+      this.logContentStages(content, parsed);
 
-      if (!content.trim().startsWith('{')) {
-        this.logger.log('Resposta nao e JSON, reprocessando...');
-        const hoje = new Date().toISOString().slice(0, 10);
-        const reprocessResponse = await axios.post(
-          this.baseUrl,
-          {
-            model: this.model,
-            temperature: 0.1,
-            messages: [
-              {
-                role: 'system',
-                content: `Voce converte texto em JSON. Hoje e ${hoje}. Retorne APENAS o JSON, sem explicacoes.
-O formato obrigatorio e:
-{
-  "replyToCustomer": "resposta ao cliente",
-  "toolCalls": [],
-  "memoryUpdates": {
-    "etapaAtual": null,
-    "dados": { "nome": null, "quantidade": null, "data_agendamento": null, "data_exibicao": null, "horario_agendamento": null },
-    "pendencias": [],
-    "resumoInterno": null
-  },
-  "needsHuman": false,
-  "shouldCreateOrder": false
-}
-Extraia o replyToCustomer do texto. Se o texto mencionar handoff ou humano, needsHuman=true.`,
-              },
-              {
-                role: 'user',
-                content: `Converta para JSON: "${content}"`,
-              },
-            ],
-          },
-          {
-            headers: {
-              Authorization: `Bearer ${this.apiKey}`,
-              'Content-Type': 'application/json',
-              'HTTP-Referer': 'http://localhost:3000',
-              'X-Title': 'Duzzi Salgados',
-            },
-            timeout: 30000,
-          },
-        );
-        content = reprocessResponse.data?.choices?.[0]?.message?.content || content;
-        content = content.replace(/^```\w*\s*/i, '').replace(/```\s*$/i, '').trim();
-        this.logger.log(`Reprocessado: ${content}`);
-      }
-
-      const repairJson = (raw: string): string => {
-        let out = '';
-        let inString = false;
-        for (let i = 0; i < raw.length; i++) {
-          const ch = raw[i];
-          const prev = i > 0 ? raw[i - 1] : '';
-          if (ch === '"' && prev !== '\\') inString = !inString;
-          else if (inString && (ch === '\n' || ch === '\r')) {
-            out += '\\n';
-            continue;
-          }
-          out += ch;
-        }
-        return out;
-      };
-
-      let parsed: any;
-      try {
-        parsed = JSON.parse(repairJson(content));
-      } catch {
-        parsed = { replyToCustomer: content, toolCalls: [], memoryUpdates: {}, needsHuman: false, shouldCreateOrder: false };
-      }
-
-      if (!parsed.memoryUpdates) parsed.memoryUpdates = {};
-      if (!parsed.toolCalls) parsed.toolCalls = [];
-      if (parsed.dados) {
-        parsed.memoryUpdates.dados = parsed.dados;
-        delete parsed.dados;
-      }
-
-      return this.sanitizeAiResult(parsed as AtendimentoAiResult, state);
+      return this.sanitizeParsedResult(parsed as AtendimentoAiResult, state);
     } catch (error: any) {
       this.logger.error(`Falha ao executar motor de IA: ${error?.message ?? error}`);
       throw error;
     }
   }
 
+  private normalizeReplyToCustomer(rawReply: unknown) {
+    const reply = typeof rawReply === 'string' ? rawReply : SALGADERIA_OPERATIONAL_TEXT.fallbackReply;
+    const normalized = sanitizeAgentReplyText(reply);
+
+    if (isBadReplyPayload(normalized)) {
+      return SALGADERIA_OPERATIONAL_TEXT.fallbackReply;
+    }
+
+    return normalized;
+  }
+
+  private isInvalidRecoveredReply(reply: string) {
+    return isBadReplyPayload(reply) || !reply.trim();
+  }
+
+  private normalizeMemoryUpdates(memoryUpdates: AtendimentoAiResult['memoryUpdates'] | undefined, state: AtendimentoState) {
+    const current = memoryUpdates || {};
+    const dadosAtuais = state.dados || {};
+    const dadosBrutos = current.dados && typeof current.dados === 'object' ? current.dados : {};
+
+    return {
+      ...current,
+      etapaAtual: normalizeEtapa(typeof current.etapaAtual === 'string' ? current.etapaAtual : null, normalizeEtapa(state.etapaAtual || 'inicio')),
+      dados: {
+        ...dadosBrutos,
+        nome: normalizeNome(dadosBrutos.nome, dadosAtuais.nome || null),
+      },
+      pendencias: normalizePendencias(current.pendencias),
+      resumoInterno: normalizeResumoInterno(current.resumoInterno),
+    };
+  }
+
   private sanitizeAiResult(parsed: AtendimentoAiResult, state: AtendimentoState): AtendimentoAiResult {
-    const replyToCustomer = typeof parsed.replyToCustomer === 'string' ? parsed.replyToCustomer.trim() : '';
-    if (!replyToCustomer) {
+    const rawReply = typeof parsed.replyToCustomer === 'string' ? parsed.replyToCustomer.trim() : '';
+    if (!rawReply) {
       throw new Error('Motor de IA retornou replyToCustomer vazio');
     }
 
     const sanitizedDados = this.sanitizeDados(parsed.memoryUpdates?.dados || {}, state.dados || {});
+    const replyToCustomer = this.sanitizeReply(rawReply, sanitizedDados);
     const isGreetingOnly = this.isGreetingOnly(state, sanitizedDados, replyToCustomer);
 
     return {
@@ -297,42 +596,66 @@ Extraia o replyToCustomer do texto. Se o texto mencionar handoff ou humano, need
       toolCalls: isGreetingOnly ? [] : this.sanitizeToolCalls(parsed.toolCalls || []),
       memoryUpdates: {
         etapaAtual: isGreetingOnly
-          ? (state.etapaAtual || 'inicio')
-          : (typeof parsed.memoryUpdates?.etapaAtual === 'string' && parsed.memoryUpdates.etapaAtual.trim()
-            ? parsed.memoryUpdates.etapaAtual.trim()
-            : state.etapaAtual || null),
+          ? normalizeEtapa(state.etapaAtual || 'inicio')
+          : normalizeEtapa(parsed.memoryUpdates?.etapaAtual, normalizeEtapa(state.etapaAtual || 'inicio')),
         dados: isGreetingOnly ? (state.dados || {}) : sanitizedDados,
-        pendencias: isGreetingOnly
-          ? []
-          : (Array.isArray(parsed.memoryUpdates?.pendencias)
-            ? parsed.memoryUpdates.pendencias.filter((item) => typeof item === 'string' && item.trim())
-            : []),
-        resumoInterno: isGreetingOnly
-          ? null
-          : (typeof parsed.memoryUpdates?.resumoInterno === 'string' && parsed.memoryUpdates.resumoInterno.trim()
-            ? parsed.memoryUpdates.resumoInterno.trim()
-            : null),
+        pendencias: isGreetingOnly ? [] : normalizePendencias(parsed.memoryUpdates?.pendencias),
+        resumoInterno: isGreetingOnly ? null : normalizeResumoInterno(parsed.memoryUpdates?.resumoInterno),
       },
       needsHuman: Boolean(parsed.needsHuman) && !isGreetingOnly,
       shouldCreateOrder: Boolean(parsed.shouldCreateOrder) && !isGreetingOnly,
     };
   }
 
-  private sanitizeToolCalls(toolCalls: ToolCall[]): ToolCall[] {
+  private sanitizeReply(reply: string, dados: Record<string, any>): string {
+    const normalized = this.normalizeReplyStyle(sanitizeAgentReplyText(reply), dados);
+    const lower = normalized.toLowerCase();
+
+    if (this.isInvalidRecoveredReply(normalized)) {
+      const partes = buildOrderSummaryParts(dados);
+      if (partes.length > 0) {
+        return buildConfirmationReply(dados);
+      }
+      return SALGADERIA_OPERATIONAL_TEXT.fallbackReply;
+    }
+
+    if (SALGADERIA_REGEX.invalidExtrasLeak.test(lower)) {
+      return SALGADERIA_OPERATIONAL_TEXT.invalidQuantityReply;
+    }
+
+    if (SALGADERIA_REGEX.readyOrderLeak.test(lower)) {
+      const partes = buildOrderSummaryParts(dados);
+      if (partes.length > 0) {
+        return buildConfirmationReply(dados);
+      }
+      return normalized.replace(SALGADERIA_REGEX.readyOrderLeak, SALGADERIA_CONFIRMATION_STYLE.repairFallbackSuffix);
+    }
+
+    if (SALGADERIA_REGEX.pix.test(lower) && !/nao trabalhamos com pix|pagamento antecipado|balcao/.test(lower)) {
+      return SALGADERIA_OPERATIONAL_TEXT.pixReply;
+    }
+
+    if (SALGADERIA_REGEX.invalidQuantityMention30.test(lower) && !SALGADERIA_REGEX.validQuantityExplanation.test(lower)) {
+      return SALGADERIA_OPERATIONAL_TEXT.invalidQuantityReply;
+    }
+
+    if (SALGADERIA_REGEX.badInstructionLeak.test(lower)) {
+      return SALGADERIA_OPERATIONAL_TEXT.invalidQuantityReply;
+    }
+
+    return normalized;
+  }
+
+  private sanitizeToolCalls(toolCalls: SalgaderiaToolCall[]): SalgaderiaToolCall[] {
     if (!Array.isArray(toolCalls)) return [];
 
-    const validNames = new Set<ToolCallName>([
-      'registrar_dados',
-      'confirmar_pedido',
-      'solicitar_handoff',
-      'registrar_observacao',
-    ]);
+    const validNames = new Set<SalgaderiaToolName>(SALGADERIA_TOOL_NAMES);
 
     return toolCalls
-      .filter((tool) => tool && typeof tool === 'object' && typeof tool.name === 'string' && validNames.has(tool.name as ToolCallName))
+      .filter((tool) => tool && typeof tool === 'object' && typeof tool.name === 'string' && validNames.has(tool.name as SalgaderiaToolName))
       .map((tool) => ({
-        name: tool.name as ToolCallName,
-        arguments: tool.arguments && typeof tool.arguments === 'object' ? tool.arguments : {},
+        name: tool.name as SalgaderiaToolName,
+        arguments: normalizeToolArguments(tool.arguments),
       }));
   }
 
@@ -345,16 +668,18 @@ Extraia o replyToCustomer do texto. Se o texto mencionar handoff ou humano, need
       || dados.horario_agendamento,
     );
     if (historico.length > 0 || hasAnyData) return false;
-    return /olá|ola|oi|bom dia|boa tarde|boa noite|opa/i.test(replyToCustomer)
-      && /como posso ajudar|como posso te ajudar|dizer o que deseja|me diga o que deseja|o que deseja/i.test(replyToCustomer);
+    return isGreetingReply(replyToCustomer);
   }
 
-    private sanitizeDados(novos: Record<string, any>, atuais: Record<string, any>): Record<string, any> {
+  private sanitizeDados(novos: Record<string, any>, atuais: Record<string, any>): Record<string, any> {
     const dados: Record<string, any> = { ...novos };
 
-    dados.nome = typeof dados.nome === 'string' && dados.nome.trim()
-      ? dados.nome.trim()
-      : atuais.nome || null;
+    dados.nome = normalizeNome(dados.nome, atuais.nome || null);
+
+    if (shouldDropForbiddenOrderFields(dados)) {
+      delete dados.endereco;
+      delete dados.tipo_entrega;
+    }
 
     const quantidade = Number(dados.quantidade);
     if (quantidade > 0 && quantidade % 25 === 0) {
@@ -384,9 +709,31 @@ Extraia o replyToCustomer do texto. Se o texto mencionar handoff ou humano, need
     return dados;
   }
 
-    private buildSystemPrompt(config: Record<string, string>) {
+  private normalizeReplyStyle(reply: string, dados: Record<string, any>) {
+    const normalized = reply.trim();
+
+    for (const blocked of SALGADERIA_REPLY_STYLE_BLOCKLIST) {
+      if (normalized.toLowerCase().includes(blocked)) {
+        const partes = buildOrderSummaryParts(dados);
+        if (partes.length > 0) {
+          return `${partes.join(' ')}?`.replace(/\s+/g, ' ').trim();
+        }
+        return SALGADERIA_OPERATIONAL_TEXT.fallbackReply;
+      }
+    }
+
+    return normalized;
+  }
+
+  private resolveNeedsHuman(value: unknown, originalMessage: string) {
+    if (!normalizeNeedsHuman(value)) return false;
+    return shouldAllowNeedsHuman(originalMessage);
+  }
+
+  private buildSystemPrompt(config: Record<string, string>) {
     const candidatePaths = [
       path.join(__dirname, 'script-atendimento.md'),
+      path.resolve(__dirname, '../../../src/modules/salgaderia/script-atendimento.md'),
       path.join(process.cwd(), 'src', 'modules', 'salgaderia', 'script-atendimento.md'),
     ];
     const scriptPath = candidatePaths.find((candidate) => fs.existsSync(candidate));
@@ -394,12 +741,6 @@ Extraia o replyToCustomer do texto. Se o texto mencionar handoff ou humano, need
       throw new Error('script-atendimento.md nao encontrado');
     }
 
-    const baseScript = fs.readFileSync(scriptPath, 'utf-8');
-
-    return baseScript
-      .replace(/\[INSERIR CHAVE PIX\]/g, config.chave_pix || 'nao configurada')
-      .replace(/\[INSERIR n[\u00fa]mero do humano de backup\]/g, config.telefone_responsavel || 'nao configurado')
-      .replace(/\[INSERIR por bairro\/regi[\u00e3]o\]/g, config.valor_frete_padrao || 'nao configurado')
-      .replace(/\[INSERIR\]/g, config.endereco_salgaderia || 'nao configurado');
+    return fs.readFileSync(scriptPath, 'utf-8');
   }
 }

@@ -1,17 +1,10 @@
 import { Entity, Column, PrimaryGeneratedColumn, CreateDateColumn, UpdateDateColumn } from 'typeorm';
 
+import { SalgaderiaEtapa, SALGADERIA_LEGACY_ETAPAS } from '../salgaderia-agent.config';
+
 export type EtapaConversa =
-  | 'inicio'
-  | 'boas_vindas'
-  | 'entender_pedido'
-  | 'coletar_nome'
-  | 'coletar_data'
-  | 'coletar_horario'
-  | 'coletar_tipo_entrega'
-  | 'coletar_endereco'
-  | 'coletar_pagamento'
-  | 'confirmacao'
-  | 'finalizado';
+  | SalgaderiaEtapa
+  | typeof SALGADERIA_LEGACY_ETAPAS[number];
 
 export type MensagemHistorico = {
   role: 'user' | 'assistant';
@@ -27,7 +20,7 @@ export class Conversa {
   @Column()
   phone: string;
 
-  @Column({ default: 'inicio' })
+  @Column({ type: 'varchar', default: 'inicio' })
   etapa_atual: EtapaConversa;
 
   @Column({ type: 'jsonb', default: '{}' })

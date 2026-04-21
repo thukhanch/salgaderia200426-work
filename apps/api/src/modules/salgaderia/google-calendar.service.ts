@@ -1,5 +1,6 @@
 import { Injectable, Logger } from '@nestjs/common';
 import axios from 'axios';
+import { buildCalendarEventDescription, buildCalendarEventSummary } from './salgaderia-agent.config';
 
 @Injectable()
 export class GoogleCalendarService {
@@ -17,8 +18,6 @@ export class GoogleCalendarService {
     phone: string;
     data_agendamento: string;
     horario_agendamento: string;
-    tipo_entrega: string;
-    endereco?: string;
     valor_final: number;
   }): Promise<string | null> {
     if (!this.calendarId || !this.serviceAccountJson) {
@@ -33,10 +32,6 @@ export class GoogleCalendarService {
       const endH = String(h + 1).padStart(2, '0');
       const endDateTime = `${pedido.data_agendamento}T${endH}:${String(m).padStart(2, '0')}:00`;
 
-      const entregaDesc = pedido.tipo_entrega === 'entrega'
-        ? `Entrega em: ${pedido.endereco}`
-        : 'Retirada no local';
-
       // Obtém token de acesso via service account
       const token = await this.getAccessToken();
       if (!token) return null;
@@ -44,14 +39,18 @@ export class GoogleCalendarService {
       const response = await axios.post(
         `https://www.googleapis.com/calendar/v3/calendars/${encodeURIComponent(this.calendarId)}/events`,
         {
-          summary: `🥟 Pedido #${pedido.id} - ${pedido.item_escolhido} (${pedido.quantidade} un)`,
-          description:
-            `Pedido #${pedido.id}\n` +
-            `Cliente: ${pedido.phone}\n` +
-            `Produto: ${pedido.item_escolhido}\n` +
-            `Quantidade: ${pedido.quantidade} unidades\n` +
-            `${entregaDesc}\n` +
-            `Valor: R$ ${Number(pedido.valor_final).toFixed(2)}`,
+          summary: buildCalendarEventSummary({
+            id: pedido.id,
+            item_escolhido: pedido.item_escolhido,
+            quantidade: pedido.quantidade,
+          }),
+          description: buildCalendarEventDescription({
+            id: pedido.id,
+            phone: pedido.phone,
+            item_escolhido: pedido.item_escolhido,
+            quantidade: pedido.quantidade,
+            valor_final: pedido.valor_final,
+          }),
           start: { dateTime: startDateTime, timeZone: 'America/Sao_Paulo' },
           end: { dateTime: endDateTime, timeZone: 'America/Sao_Paulo' },
           colorId: '11', // vermelho tomate = pedido urgente

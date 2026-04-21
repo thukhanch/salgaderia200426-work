@@ -4,6 +4,7 @@ import {
 import { SalgaderiaService } from './salgaderia.service';
 import { EvolutionApiService } from './evolution-api.service';
 import { WhatsappService } from '../whatsapp/whatsapp.service';
+import { buildReminderMessage } from './salgaderia-agent.config';
 
 @Controller('salgaderia')
 export class SalgaderiaController {
@@ -80,12 +81,11 @@ export class SalgaderiaController {
 
     for (const pedido of pedidos) {
       try {
-        const msg =
-          `⏰ *Lembrete do seu pedido!*\n\n` +
-          `🥟 ${pedido.item_escolhido} - ${pedido.quantidade} unidades\n` +
-          `📅 Amanhã às ${pedido.horario_agendamento}\n` +
-          `${pedido.tipo_entrega === 'entrega' ? `🚗 Entrega em: ${pedido.endereco}` : '🏪 Retirada no local'}\n\n` +
-          `Qualquer dúvida, é só chamar! 😊`;
+        const msg = buildReminderMessage({
+          item_escolhido: pedido.item_escolhido,
+          quantidade: pedido.quantidade,
+          horario_agendamento: pedido.horario_agendamento,
+        });
 
         await this.salgaderiaService.enviarMensagemPelaSessaoAtiva(pedido.phone, msg);
         await this.salgaderiaService.marcarLembreteClienteEnviado(pedido.id);
@@ -99,11 +99,20 @@ export class SalgaderiaController {
   }
 
   @Post('simular')
-  async simularMensagem(@Body() body: { phone: string; text: string }) {
+  async simularMensagem(@Body() body: { phone?: string; text?: string; message?: string }) {
+    const texto = typeof body.text === 'string' ? body.text : body.message;
+    const phone = typeof body.phone === 'string' && body.phone.trim()
+      ? body.phone
+      : '+5511999999999';
     const { resposta, handoff, pedidoConfirmado } = await this.salgaderiaService.processarMensagem(
-      body.phone,
-      body.text,
+      phone,
+      texto || '',
     );
     return { resposta, handoff, pedidoConfirmado: pedidoConfirmado?.id };
+  }
+
+  @Get('diagnostico-prompt')
+  async diagnosticoPrompt() {
+    return this.salgaderiaService.gerarDiagnosticoPrompt();
   }
 }
