@@ -126,7 +126,6 @@ function parseAcceptance(text: string): { accepted: boolean; orderId?: string } 
     return { accepted: false };
   }
 
-  // Tenta extrair ID do pedido (ex: "OK ABC123" ou "ok ab1c2d")
   const idPattern = /\b([a-z0-9]{6})\b/i;
   const match = text.match(idPattern);
   const orderId = match ? match[1].toUpperCase() : undefined;
@@ -134,15 +133,33 @@ function parseAcceptance(text: string): { accepted: boolean; orderId?: string } 
   return { accepted: true, orderId };
 }
 
+function parseDeliveryCompletion(text: string): { delivered: boolean; orderId?: string } {
+  const normalized = text.trim();
+  if (!/^entregue\b/i.test(normalized)) {
+    return { delivered: false };
+  }
+
+  const idMatch = normalized.match(/ENTREGUE\s+([A-Z0-9]{6})/i);
+  return {
+    delivered: true,
+    orderId: idMatch ? idMatch[1].toUpperCase() : undefined,
+  };
+}
+
 export async function processMoboyMessage(
   phone: string,
   text: string,
   businessId: string,
 ): Promise<void> {
+  const completion = parseDeliveryCompletion(text);
+  if (completion.delivered) {
+    await handleDeliveryComplete(phone, completion.orderId, businessId);
+    return;
+  }
+
   const { accepted, orderId } = parseAcceptance(text);
 
   if (!accepted) {
-    // Mensagem genérica — verifica se há pedidos pendentes antes de responder
     const hasPending = await prisma.order.count({
       where: { businessId, motoboyStatus: 'notified', deliveryType: 'delivery' },
     });
@@ -155,11 +172,9 @@ export async function processMoboyMessage(
     return;
   }
 
-  // Encontra o pedido correto
   let order: any = null;
 
   if (orderId) {
-    // Busca pelo ID informado
     order = await prisma.order.findFirst({
       where: {
         businessId,
@@ -169,7 +184,6 @@ export async function processMoboyMessage(
       },
     });
   } else {
-    // Sem ID — pega o mais recente
     order = await prisma.order.findFirst({
       where: { businessId, motoboyStatus: 'notified', deliveryType: 'delivery' },
       orderBy: { createdAt: 'desc' },
@@ -181,24 +195,21 @@ export async function processMoboyMessage(
     return;
   }
 
-  // Aceite atômico via banco — evita race condition
-  // updateMany retorna count=0 se outro motoboy já aceitou
   const motoboy = await prisma.motoboy.findUnique({
     where: { businessId_phone: { businessId, phone } },
   });
   const motoboyName = motoboy?.name ?? phone;
 
   const updated = await prisma.order.updateMany({
-    where: { id: order.id, motoboyStatus: 'notified' }, // condição atômica
+    where: { id: order.id, motoboyStatus: 'notified' },
     data: {
       motoboyPhone: phone,
-      motoboyName: motoboyName,
+      motoboyName,
       motoboyStatus: 'accepted',
     },
   });
 
   if (updated.count === 0) {
-    // Outro motoboy ganhou a corrida
     await sendMessage(phone, '🏃 Essa entrega já foi aceita por outro motoboy. Aguarde o próximo!');
     return;
   }
@@ -206,7 +217,6 @@ export async function processMoboyMessage(
   const items = (order.items as any[]).map(i => `${i.quantity}x ${i.name}`).join(', ');
   const ordShort = order.id.slice(-6).toUpperCase();
 
-  // Confirma para o motoboy
   await sendMessage(
     phone,
     `✅ *Entrega #${ordShort} confirmada para você, ${motoboyName}!*\n\n` +
@@ -215,25 +225,22 @@ export async function processMoboyMessage(
       `Quando concluir, responda *ENTREGUE ${ordShort}*. Boa corrida! 🛵💨`,
   );
 
-  // Avisa outros motoboys
   const others = await prisma.motoboy.findMany({
     where: { businessId, active: true, NOT: { phone } },
   });
   for (const other of others) {
     try {
       await sendMessage(other.phone, `ℹ️ Pedido #${ordShort} foi aceito. Aguarde o próximo!`);
-    } catch { /* opcional */ }
+    } catch {}
   }
 
-  // Notifica cliente
   try {
     await sendMessage(
       order.phone,
       `🛵 *Seu pedido saiu para entrega!*\nMotoboy: ${motoboyName}\nChegando em breve! 😊`,
     );
-  } catch { /* opcional */ }
+  } catch {}
 
-  // Notifica dono
   try {
     const business = await prisma.business.findUnique({ where: { id: businessId } });
     if (business?.ownerPhone) {
@@ -242,28 +249,35 @@ export async function processMoboyMessage(
         `🛵 Motoboy *${motoboyName}* aceitou o pedido #${ordShort}.`,
       );
     }
-  } catch { /* opcional */ }
+  } catch {}
 
   console.log(`✅ Entrega #${ordShort} aceita por ${motoboyName}`);
-
-  // Verifica entrega concluída
-  if (text.toUpperCase().includes('ENTREGUE')) {
-    await handleDeliveryComplete(phone, text, businessId);
-  }
 }
 
-async function handleDeliveryComplete(phone: string, text: string, businessId: string) {
-  const idMatch = text.match(/ENTREGUE\s+([A-Z0-9]{6})/i);
-  const order = idMatch
+async function handleDeliveryComplete(phone: string, orderId: string | undefined, businessId: string) {
+  const order = orderId
     ? await prisma.order.findFirst({
-        where: { businessId, motoboyPhone: phone, id: { endsWith: idMatch[1].toLowerCase() } },
+        where: {
+          businessId,
+          motoboyPhone: phone,
+          motoboyStatus: 'accepted',
+          id: { endsWith: orderId.toLowerCase() },
+        },
       })
     : await prisma.order.findFirst({
         where: { businessId, motoboyPhone: phone, motoboyStatus: 'accepted' },
         orderBy: { updatedAt: 'desc' },
       });
 
-  if (!order) return;
+  if (!order) {
+    await sendMessage(
+      phone,
+      orderId
+        ? `⚠️ Não encontrei uma entrega aceita com o código #${orderId}.`
+        : '⚠️ Você não possui nenhuma entrega aceita para concluir agora.',
+    );
+    return;
+  }
 
   await prisma.order.update({
     where: { id: order.id },
@@ -271,9 +285,9 @@ async function handleDeliveryComplete(phone: string, text: string, businessId: s
   });
 
   const ordShort = order.id.slice(-6).toUpperCase();
-  await sendMessage(phone, `🎉 Entrega #${ordShort} marcada como concluída! Obrigado, ${phone}!`);
+  await sendMessage(phone, `🎉 Entrega #${ordShort} marcada como concluída! Obrigado!`);
 
   try {
     await sendMessage(order.phone, `✅ Entrega confirmada! Obrigado pela preferência. 😊`);
-  } catch { /* opcional */ }
+  } catch {}
 }

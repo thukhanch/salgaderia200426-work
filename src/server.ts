@@ -1,11 +1,56 @@
 import 'dotenv/config';
 import Fastify from 'fastify';
+import type { Prisma } from '@prisma/client';
 import { connect, setMessageHandler, setMotoboyHandler, setOwnerHandler } from './whatsapp/client';
 import { processMessage } from './agent/agent';
 import { prisma } from './db/client';
 import { isMotoboy, processMoboyMessage, invalidateMotoboyCache } from './motoboy/motoboy.service';
 import { isOwner, processOwnerCommand } from './admin/admin.service';
 import { getPaymentStatus } from './payment/mercadopago';
+
+type BusinessPayload = {
+  name: string;
+  ownerPhone: string;
+  description?: string;
+  hours?: Record<string, unknown>;
+  menu?: unknown[];
+  config?: Record<string, unknown>;
+};
+
+type MotoboyPayload = {
+  name: string;
+  phone: string;
+};
+
+type SendPayload = {
+  phone: string;
+  message: string;
+};
+
+type PaymentWebhookPayload = {
+  type?: string;
+  data?: {
+    id?: string | number;
+  };
+};
+
+const PHONE_REGEX = /^\d{10,15}$/;
+
+function isNonEmptyString(value: unknown): value is string {
+  return typeof value === 'string' && value.trim().length > 0;
+}
+
+function isPhone(value: unknown): value is string {
+  return isNonEmptyString(value) && PHONE_REGEX.test(value.trim());
+}
+
+function toJsonObject(value: Record<string, unknown> | undefined): Prisma.InputJsonObject {
+  return (value ?? {}) as Prisma.InputJsonObject;
+}
+
+function toJsonArray(value: unknown[] | undefined): Prisma.InputJsonArray {
+  return (value ?? []) as Prisma.InputJsonArray;
+}
 
 const app = Fastify({
   logger: { level: 'info' },
@@ -34,15 +79,43 @@ app.addHook('onRequest', async (req, reply) => {
 app.get('/health', async () => ({ status: 'ok', timestamp: new Date().toISOString() }));
 
 // ── Negócio ───────────────────────────────────────────────────────────────────
-app.post<{ Body: any }>('/business', async (req, reply) => {
+app.post<{ Body: BusinessPayload }>('/business', async (req, reply) => {
   const { name, ownerPhone, description, hours, menu, config } = req.body;
-  if (!name || !ownerPhone) return reply.status(400).send({ error: 'name e ownerPhone obrigatórios' });
+  if (!isNonEmptyString(name) || !isPhone(ownerPhone)) {
+    return reply.status(400).send({ error: 'name e ownerPhone válidos são obrigatórios' });
+  }
+  if (description !== undefined && typeof description !== 'string') {
+    return reply.status(400).send({ error: 'description deve ser texto' });
+  }
+  if (hours !== undefined && (typeof hours !== 'object' || hours === null || Array.isArray(hours))) {
+    return reply.status(400).send({ error: 'hours deve ser um objeto' });
+  }
+  if (menu !== undefined && !Array.isArray(menu)) {
+    return reply.status(400).send({ error: 'menu deve ser uma lista' });
+  }
+  if (config !== undefined && (typeof config !== 'object' || config === null || Array.isArray(config))) {
+    return reply.status(400).send({ error: 'config deve ser um objeto' });
+  }
 
   const id = await resolveBusinessId();
   const business = await prisma.business.upsert({
     where: { id: id || 'placeholder' },
-    create: { name, ownerPhone, description, hours: hours ?? {}, menu: menu ?? [], config: config ?? {} },
-    update: { name, ownerPhone, description, hours, menu, config },
+    create: {
+      name: name.trim(),
+      ownerPhone: ownerPhone.trim(),
+      description: description?.trim() || undefined,
+      hours: toJsonObject(hours),
+      menu: toJsonArray(menu),
+      config: toJsonObject(config),
+    },
+    update: {
+      name: name.trim(),
+      ownerPhone: ownerPhone.trim(),
+      description: description?.trim() || undefined,
+      hours: toJsonObject(hours),
+      menu: toJsonArray(menu),
+      config: toJsonObject(config),
+    },
   });
 
   businessId = business.id;
@@ -61,16 +134,19 @@ app.get('/motoboys', async () => {
   return prisma.motoboy.findMany({ where: { businessId: id } });
 });
 
-app.post<{ Body: { name: string; phone: string } }>('/motoboys', async (req, reply) => {
+app.post<{ Body: MotoboyPayload }>('/motoboys', async (req, reply) => {
   const { name, phone } = req.body;
-  if (!name || !phone) return reply.status(400).send({ error: 'name e phone obrigatórios' });
+  if (!isNonEmptyString(name) || !isPhone(phone)) {
+    return reply.status(400).send({ error: 'name e phone válidos são obrigatórios' });
+  }
   const id = await resolveBusinessId();
   if (!id) return reply.status(400).send({ error: 'Negócio não configurado' });
 
+  const normalizedPhone = phone.trim();
   const motoboy = await prisma.motoboy.upsert({
-    where: { businessId_phone: { businessId: id, phone } },
-    create: { businessId: id, name, phone },
-    update: { name, active: true },
+    where: { businessId_phone: { businessId: id, phone: normalizedPhone } },
+    create: { businessId: id, name: name.trim(), phone: normalizedPhone },
+    update: { name: name.trim(), active: true },
   });
   invalidateMotoboyCache();
   return motoboy;
@@ -108,19 +184,25 @@ app.get('/conversations', async () => {
 });
 
 // ── Reiniciar conversa (handoff encerrado) ────────────────────────────────────
-app.post<{ Params: { phone: string } }>('/conversations/:phone/reopen', async (req) => {
+app.post<{ Params: { phone: string } }>('/conversations/:phone/reopen', async (req, reply) => {
+  if (!isPhone(req.params.phone)) {
+    return reply.status(400).send({ error: 'phone inválido' });
+  }
+
   const id = await resolveBusinessId();
   await prisma.conversation.updateMany({
-    where: { businessId: id, phone: req.params.phone },
+    where: { businessId: id, phone: req.params.phone.trim() },
     data: { status: 'active' },
   });
   return { reopened: true };
 });
 
 // ── MercadoPago Webhook ───────────────────────────────────────────────────────
-app.post<{ Body: any }>('/payment/webhook', async (req, reply) => {
-  const { type, data } = req.body ?? {};
-  if (type !== 'payment' || !data?.id) return reply.status(200).send('ok');
+app.post<{ Body: PaymentWebhookPayload }>('/payment/webhook', async (req, reply) => {
+  const { type, data } = req.body;
+  if (type !== 'payment' || data?.id === undefined || data?.id === null) {
+    return reply.status(200).send('ok');
+  }
 
   const paymentId = String(data.id);
   const status = await getPaymentStatus(paymentId);
@@ -148,11 +230,13 @@ app.get('/payment/success', async () => ({ message: 'Pagamento realizado! Obriga
 app.get('/payment/failure', async () => ({ message: 'Pagamento não aprovado. Tente novamente.' }));
 
 // ── Envio manual (testes) ─────────────────────────────────────────────────────
-app.post<{ Body: { phone: string; message: string } }>('/send', async (req, reply) => {
+app.post<{ Body: SendPayload }>('/send', async (req, reply) => {
   const { phone, message } = req.body;
-  if (!phone || !message) return reply.status(400).send({ error: 'phone e message obrigatórios' });
+  if (!isPhone(phone) || !isNonEmptyString(message)) {
+    return reply.status(400).send({ error: 'phone válido e message obrigatórios' });
+  }
   const { sendMessage } = await import('./whatsapp/client');
-  await sendMessage(phone, message);
+  await sendMessage(phone.trim(), message.trim());
   return { sent: true };
 });
 
