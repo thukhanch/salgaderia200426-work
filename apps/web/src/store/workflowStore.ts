@@ -1,5 +1,6 @@
 import { create } from 'zustand';
-import { Node, Edge, applyNodeChanges, applyEdgeChanges, NodeChange, EdgeChange } from '@xyflow/react';
+import { applyNodeChanges, applyEdgeChanges } from '@xyflow/react';
+import type { Node, Edge, NodeChange, EdgeChange } from '@xyflow/react';
 import axios from 'axios';
 
 const API = 'http://localhost:3000/api';

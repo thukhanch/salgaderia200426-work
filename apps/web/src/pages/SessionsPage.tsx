@@ -11,6 +11,7 @@ export function SessionsPage() {
   const [showModal, setShowModal] = useState(false);
   const [newName, setNewName] = useState('');
   const [qrCodes, setQrCodes] = useState<Record<string, string>>({});
+  const [activeSessionId, setActiveSessionId] = useState('');
 
   useEffect(() => {
     fetchSessions();
@@ -29,12 +30,20 @@ export function SessionsPage() {
       setSessions((prev) => prev.map((s) => s.id === sessionId ? { ...s, status: 'disconnected' } : s));
     });
 
-    return () => { socket.off('session:qr'); socket.off('session:connected'); socket.off('session:disconnected'); };
+    return () => {
+      socket.off('session:qr');
+      socket.off('session:connected');
+      socket.off('session:disconnected');
+    };
   }, []);
 
   const fetchSessions = async () => {
-    const { data } = await axios.get(`${API}/whatsapp/sessions`);
+    const [{ data }, { data: salgaderia }] = await Promise.all([
+      axios.get(`${API}/whatsapp/sessions`),
+      axios.get(`${API}/salgaderia/sessoes`),
+    ]);
     setSessions(data);
+    setActiveSessionId(salgaderia.ativa || '');
   };
 
   const handleCreate = async () => {
@@ -43,7 +52,7 @@ export function SessionsPage() {
     setSessions((prev) => [...prev, data]);
     setShowModal(false);
     setNewName('');
-    toast.success('Sessu00e3o criada!');
+    toast.success('Sessão criada!');
   };
 
   const handleConnect = (sessionId: string) => {
@@ -58,15 +67,24 @@ export function SessionsPage() {
   const handleDelete = async (sessionId: string) => {
     await axios.delete(`${API}/whatsapp/sessions/${sessionId}`);
     setSessions((prev) => prev.filter((s) => s.id !== sessionId));
-    toast.success('Sessu00e3o removida');
+    if (activeSessionId === sessionId) {
+      setActiveSessionId('');
+    }
+    toast.success('Sessão removida');
+  };
+
+  const handleSetActive = async (sessionId: string) => {
+    await axios.put(`${API}/salgaderia/sessao-ativa`, { sessionId });
+    setActiveSessionId(sessionId);
+    toast.success('Sessão vinculada à salgaderia!');
   };
 
   const statusBadge = (status: string) => {
     const map: Record<string, [string, string]> = {
-      connected: ['badge-green', 'u25cf Conectado'],
-      qr_waiting: ['badge-yellow', 'u25d4 Aguardando QR'],
-      connecting: ['badge-yellow', 'u2026 Conectando'],
-      disconnected: ['badge-gray', 'u25cb Desconectado'],
+      connected: ['badge-green', '● Conectado'],
+      qr_waiting: ['badge-yellow', '◔ Aguardando QR'],
+      connecting: ['badge-yellow', '… Conectando'],
+      disconnected: ['badge-gray', '○ Desconectado'],
     };
     const [cls, label] = map[status] || ['badge-gray', status];
     return <span className={`badge ${cls}`}>{label}</span>;
@@ -75,15 +93,22 @@ export function SessionsPage() {
   return (
     <div className="page">
       <div className="page-header">
-        <h1 className="page-title">Sessu00f5es WhatsApp</h1>
-        <button className="btn btn-primary" onClick={() => setShowModal(true)}>+ Nova Sessu00e3o</button>
+        <h1 className="page-title">Sessões WhatsApp</h1>
+        <button className="btn btn-primary" onClick={() => setShowModal(true)}>+ Nova Sessão</button>
       </div>
 
       <div className="grid">
         {sessions.map((s) => (
           <div key={s.id} className="card">
-            <div style={{ display: 'flex', justifyContent: 'space-between', marginBottom: 12 }}>
-              <h3 style={{ fontSize: 16, fontWeight: 600 }}>{s.name}</h3>
+            <div style={{ display: 'flex', justifyContent: 'space-between', marginBottom: 12, gap: 12 }}>
+              <div>
+                <h3 style={{ fontSize: 16, fontWeight: 600 }}>{s.name}</h3>
+                {activeSessionId === s.id && (
+                  <p style={{ fontSize: 11, color: '#25d366', marginTop: 6, fontWeight: 600 }}>
+                    Sessão ativa da salgaderia
+                  </p>
+                )}
+              </div>
               {statusBadge(s.status)}
             </div>
 
@@ -94,7 +119,7 @@ export function SessionsPage() {
               </div>
             )}
 
-            <div style={{ display: 'flex', gap: 8 }}>
+            <div style={{ display: 'flex', gap: 8, flexWrap: 'wrap' }}>
               {s.status === 'disconnected' && (
                 <button className="btn btn-primary" style={{ flex: 1 }} onClick={() => handleConnect(s.id)}>
                   Conectar
@@ -105,7 +130,15 @@ export function SessionsPage() {
                   Desconectar
                 </button>
               )}
-              <button className="btn btn-danger" onClick={() => handleDelete(s.id)}>u2715</button>
+              <button
+                className="btn btn-secondary"
+                style={{ flex: 1 }}
+                onClick={() => handleSetActive(s.id)}
+                disabled={activeSessionId === s.id}
+              >
+                {activeSessionId === s.id ? 'Em uso' : 'Usar na salgaderia'}
+              </button>
+              <button className="btn btn-danger" onClick={() => handleDelete(s.id)}>✕</button>
             </div>
           </div>
         ))}
@@ -113,18 +146,18 @@ export function SessionsPage() {
 
       {sessions.length === 0 && (
         <div style={{ textAlign: 'center', color: '#555', marginTop: 80 }}>
-          <p style={{ fontSize: 48, marginBottom: 16 }}>uD83DuDCF1</p>
-          <p style={{ fontSize: 18 }}>Nenhuma sessu00e3o ainda</p>
-          <p style={{ fontSize: 14, marginTop: 8 }}>Conecte seu WhatsApp para comeu00e7ar</p>
+          <p style={{ fontSize: 48, marginBottom: 16 }}>📱</p>
+          <p style={{ fontSize: 18 }}>Nenhuma sessão ainda</p>
+          <p style={{ fontSize: 14, marginTop: 8 }}>Conecte seu WhatsApp para começar</p>
         </div>
       )}
 
       {showModal && (
         <div className="modal-overlay" onClick={() => setShowModal(false)}>
           <div className="modal" onClick={(e) => e.stopPropagation()}>
-            <h2 className="modal-title">Nova Sessu00e3o WhatsApp</h2>
+            <h2 className="modal-title">Nova Sessão WhatsApp</h2>
             <div className="form-group">
-              <label>Nome da sessu00e3o</label>
+              <label>Nome da sessão</label>
               <input
                 autoFocus
                 value={newName}

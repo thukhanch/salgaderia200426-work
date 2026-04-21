@@ -4,10 +4,18 @@ import toast from 'react-hot-toast';
 
 const API = 'http://localhost:3000/api/salgaderia';
 
+type Session = {
+  id: string;
+  name: string;
+  status: string;
+};
+
 export function SalgaderiaPage() {
   const [pedidos, setPedidos] = useState<any[]>([]);
   const [clientes, setClientes] = useState<any[]>([]);
   const [configs, setConfigs] = useState<any[]>([]);
+  const [sessions, setSessions] = useState<Session[]>([]);
+  const [activeSessionId, setActiveSessionId] = useState('');
   const [tab, setTab] = useState<'pedidos' | 'clientes' | 'config' | 'testar'>('pedidos');
   const [testPhone, setTestPhone] = useState('5519999999999');
   const [testMsg, setTestMsg] = useState('');
@@ -20,14 +28,17 @@ export function SalgaderiaPage() {
 
   const fetchAll = async () => {
     try {
-      const [p, c, cfg] = await Promise.all([
+      const [p, c, cfg, sess] = await Promise.all([
         axios.get(`${API}/pedidos`),
         axios.get(`${API}/clientes`),
         axios.get(`${API}/configuracoes`),
+        axios.get(`${API}/sessoes`),
       ]);
       setPedidos(p.data);
       setClientes(c.data);
       setConfigs(cfg.data);
+      setSessions(sess.data.sessoes || []);
+      setActiveSessionId(sess.data.ativa || '');
       const cfgMap: Record<string, string> = {};
       cfg.data.forEach((c: any) => { cfgMap[c.chave] = c.valor; });
       setEditingConfig(cfgMap);
@@ -56,12 +67,25 @@ export function SalgaderiaPage() {
     toast.success('Configuração salva!');
   };
 
+  const handleSaveActiveSession = async () => {
+    await axios.put(`${API}/sessao-ativa`, { sessionId: activeSessionId });
+    toast.success('Sessão ativa salva!');
+    fetchAll();
+  };
+
   const statusColor: Record<string, string> = {
     confirmado: '#25d366',
     em_producao: '#f59e0b',
     pronto: '#3b82f6',
     entregue: '#8b5cf6',
     cancelado: '#ef4444',
+  };
+
+  const sessionStatusLabel: Record<string, string> = {
+    connected: 'Conectada',
+    qr_waiting: 'Aguardando QR',
+    connecting: 'Conectando',
+    disconnected: 'Desconectada',
   };
 
   return (
@@ -71,7 +95,43 @@ export function SalgaderiaPage() {
         <button className="btn btn-secondary" onClick={fetchAll}>↻ Atualizar</button>
       </div>
 
-      {/* Tabs */}
+      <div className="card" style={{ marginBottom: 24 }}>
+        <div style={{ display: 'flex', justifyContent: 'space-between', gap: 16, flexWrap: 'wrap' }}>
+          <div>
+            <p style={{ fontSize: 13, color: '#888', marginBottom: 6 }}>Sessão WhatsApp ativa</p>
+            <p style={{ fontSize: 16, fontWeight: 600 }}>
+              {sessions.find((session) => session.id === activeSessionId)?.name || 'Nenhuma sessão selecionada'}
+            </p>
+            <p style={{ fontSize: 12, color: '#555', marginTop: 6 }}>
+              {activeSessionId
+                ? `Status: ${sessionStatusLabel[sessions.find((session) => session.id === activeSessionId)?.status || 'disconnected'] || 'Desconhecido'}`
+                : 'Selecione uma sessão conectada para o bot responder no WhatsApp real.'}
+            </p>
+          </div>
+
+          <div style={{ minWidth: 280, flex: 1, maxWidth: 420 }}>
+            <label>Sessão usada pela salgaderia</label>
+            <div style={{ display: 'flex', gap: 10, marginTop: 8 }}>
+              <select
+                value={activeSessionId}
+                onChange={(e) => setActiveSessionId(e.target.value)}
+                style={{ flex: 1 }}
+              >
+                <option value="">Selecione uma sessão</option>
+                {sessions.map((session) => (
+                  <option key={session.id} value={session.id}>
+                    {session.name} — {sessionStatusLabel[session.status] || session.status}
+                  </option>
+                ))}
+              </select>
+              <button className="btn btn-primary" onClick={handleSaveActiveSession} disabled={!activeSessionId}>
+                Salvar
+              </button>
+            </div>
+          </div>
+        </div>
+      </div>
+
       <div style={{ display: 'flex', gap: 8, marginBottom: 24, borderBottom: '1px solid #2a2a2a', paddingBottom: 0 }}>
         {(['pedidos', 'clientes', 'config', 'testar'] as const).map(t => (
           <button key={t} onClick={() => setTab(t)} style={{
@@ -83,7 +143,6 @@ export function SalgaderiaPage() {
         ))}
       </div>
 
-      {/* Pedidos */}
       {tab === 'pedidos' && (
         <div>
           <p style={{ color: '#555', marginBottom: 16, fontSize: 13 }}>{pedidos.length} pedido(s) registrado(s)</p>
@@ -125,7 +184,6 @@ export function SalgaderiaPage() {
         </div>
       )}
 
-      {/* Clientes */}
       {tab === 'clientes' && (
         <div className="grid">
           {clientes.map(c => (
@@ -143,7 +201,6 @@ export function SalgaderiaPage() {
         </div>
       )}
 
-      {/* Configurações */}
       {tab === 'config' && (
         <div style={{ maxWidth: 560 }}>
           <p style={{ color: '#555', marginBottom: 20, fontSize: 13 }}>
@@ -167,7 +224,6 @@ export function SalgaderiaPage() {
         </div>
       )}
 
-      {/* Testar */}
       {tab === 'testar' && (
         <div style={{ maxWidth: 560 }}>
           <p style={{ color: '#555', marginBottom: 20, fontSize: 13 }}>

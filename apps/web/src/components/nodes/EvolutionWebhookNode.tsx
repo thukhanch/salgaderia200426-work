@@ -1,4 +1,3 @@
-import { Handle, Position } from '@xyflow/react';
 import { BaseNode } from './BaseNode';
 
 export function EvolutionWebhookNode({ data }: any) {

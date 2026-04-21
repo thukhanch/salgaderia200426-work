@@ -2,14 +2,22 @@ import { Entity, Column, PrimaryGeneratedColumn, CreateDateColumn, UpdateDateCol
 
 export type EtapaConversa =
   | 'inicio'
-  | 'aguardando_item'
-  | 'aguardando_quantidade'
-  | 'aguardando_data'
-  | 'aguardando_horario'
-  | 'aguardando_tipo_entrega'
-  | 'aguardando_endereco'
-  | 'aguardando_confirmacao'
+  | 'boas_vindas'
+  | 'entender_pedido'
+  | 'coletar_nome'
+  | 'coletar_data'
+  | 'coletar_horario'
+  | 'coletar_tipo_entrega'
+  | 'coletar_endereco'
+  | 'coletar_pagamento'
+  | 'confirmacao'
   | 'finalizado';
+
+export type MensagemHistorico = {
+  role: 'user' | 'assistant';
+  content: string;
+  timestamp: string;
+};
 
 @Entity('conversas')
 export class Conversa {
@@ -27,6 +35,13 @@ export class Conversa {
 
   @Column({ default: false })
   pedido_em_aberto: boolean;
+
+  // Histórico completo de mensagens trocadas
+  @Column({ type: 'jsonb', default: '[]' })
+  historico_mensagens: MensagemHistorico[];
+
+  @Column({ type: 'timestamp', nullable: true })
+  ultima_interacao: Date;
 
   @CreateDateColumn()
   created_at: Date;

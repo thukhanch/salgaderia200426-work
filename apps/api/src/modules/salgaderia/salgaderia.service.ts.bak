@@ -211,10 +211,16 @@ export class SalgaderiaService implements OnModuleInit, OnModuleDestroy {
 
   private construirPendencias(dados: Record<string, any>) {
     const pendencias: string[] = [];
-    if (!dados.quantidade) pendencias.push("quantidade de coxinhas");
-    if (!dados.nome) pendencias.push("nome do cliente");
-    if (!dados.data_agendamento) pendencias.push("data do pedido");
-    if (!dados.horario_agendamento) pendencias.push("horario do pedido");
+    const itens: ItemPedido[] = dados.itens || [];
+
+    if (!itens.length) pendencias.push('itens do pedido');
+    if (!dados.nome) pendencias.push('nome do cliente');
+    if (!dados.data_agendamento) pendencias.push('data do pedido');
+    if (!dados.horario_agendamento) pendencias.push('horario do pedido');
+    if (!dados.tipo_entrega) pendencias.push('modalidade de retirada ou entrega');
+    if (dados.tipo_entrega === 'entrega' && !dados.endereco) pendencias.push('endereco de entrega');
+    if (!dados.pagamento) pendencias.push('forma de pagamento');
+
     return pendencias;
   }
 

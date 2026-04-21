@@ -34,7 +34,7 @@ export default function App() {
               1. Vá em "Sessões WhatsApp"<br />
               2. Crie uma sessão<br />
               3. Escaneie o QR Code<br />
-              4. Configure o webhook no Evolution API
+              4. Defina a sessão ativa na tela da salgaderia
             </p>
           </div>
         </aside>

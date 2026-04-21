@@ -50,7 +50,7 @@ export function NodeConfigPanel({ node, onClose }: Props) {
             <input value={data.sessionId || ''} onChange={(e) => update('sessionId', e.target.value)} />
           </div>
           <div className="form-group">
-            <label>Para (nu00famero ou {{trigger.from}})</label>
+            <label>{'Para (número ou {{trigger.from}})'}</label>
             <input value={data.to || ''} onChange={(e) => update('to', e.target.value)} />
           </div>
           <div className="form-group">

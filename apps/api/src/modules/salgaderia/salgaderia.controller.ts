@@ -1,9 +1,9 @@
 import {
-  Controller, Post, Get, Put, Body, Param, Headers, HttpCode, Logger
+  Controller, Post, Get, Put, Body, Param, Headers, HttpCode, Logger,
 } from '@nestjs/common';
 import { SalgaderiaService } from './salgaderia.service';
 import { EvolutionApiService } from './evolution-api.service';
-import { GoogleCalendarService } from './google-calendar.service';
+import { WhatsappService } from '../whatsapp/whatsapp.service';
 
 @Controller('salgaderia')
 export class SalgaderiaController {
@@ -12,16 +12,13 @@ export class SalgaderiaController {
   constructor(
     private readonly salgaderiaService: SalgaderiaService,
     private readonly evolutionApi: EvolutionApiService,
-    private readonly googleCalendar: GoogleCalendarService,
+    private readonly whatsappService: WhatsappService,
   ) {}
 
-  // ─── Webhook da Evolution API ─────────────────────────────────────
-  // Este é o endpoint que a Evolution API chama quando chega mensagem
   @Post('webhook')
   @HttpCode(200)
   async receberMensagem(@Body() payload: any, @Headers() headers: any) {
     try {
-      // Extrai dados da mensagem
       const extracted = this.evolutionApi.extractMessage(payload);
 
       if (!extracted) {
@@ -29,52 +26,16 @@ export class SalgaderiaController {
         return { ok: true };
       }
 
-      const { phone, text } = extracted;
-      this.logger.log(`📱 Mensagem de ${phone}: "${text}"`);
-
-      // Processa na máquina de estados
-      const { resposta, handoff, pedidoConfirmado } = await this.salgaderiaService.processarMensagem(phone, text);
-
-      // Envia resposta via Evolution API
-      await this.evolutionApi.sendText(phone, resposta);
-
-      // Se pedido confirmado: cria evento no Google Agenda
-      if (pedidoConfirmado) {
-        const eventId = await this.googleCalendar.criarEvento(pedidoConfirmado);
-        if (eventId) {
-          // Salva o ID do evento no pedido
-          await this.salgaderiaService['pedidoRepo'].update(pedidoConfirmado.id, {
-            google_event_id: eventId,
-          });
-        }
-
-        // Envia resumo de produção para o dono
-        const donoWhatsapp = await this.salgaderiaService.getConfig('dono_whatsapp');
-        if (donoWhatsapp) {
-          const resumo = this.salgaderiaService.gerarResumoProd(pedidoConfirmado);
-          await this.evolutionApi.sendText('+' + donoWhatsapp, `🔔 *NOVO PEDIDO CONFIRMADO!*\n\n${resumo}`);
-        }
-      }
-
-      // Handoff: avisa o dono
-      if (handoff) {
-        const donoWhatsapp = await this.salgaderiaService.getConfig('dono_whatsapp');
-        if (donoWhatsapp) {
-          await this.evolutionApi.sendText(
-            '+' + donoWhatsapp,
-            `🚨 *HANDOFF NECESSÁRIO!*\n\nCliente ${phone} precisa de atendimento humano.\n\nÚltima mensagem: "${text}"`
-          );
-        }
-      }
+      const sessionId = await this.salgaderiaService.getConfig('whatsapp_session_id');
+      await this.salgaderiaService.processarMensagemRecebida(sessionId, extracted.phone, extracted.text);
 
       return { ok: true };
-    } catch (error) {
+    } catch (error: any) {
       this.logger.error(`Erro no webhook: ${error.message}`, error.stack);
       return { ok: false, error: error.message };
     }
   }
 
-  // ─── API REST para o dashboard ────────────────────────────────────
   @Get('pedidos')
   listarPedidos() {
     return this.salgaderiaService.listarPedidos();
@@ -100,7 +61,18 @@ export class SalgaderiaController {
     return this.salgaderiaService.updateConfig(chave, body.valor);
   }
 
-  // ─── Lembretes (chamado via cron ou manualmente) ──────────────────
+  @Get('sessoes')
+  async listarSessoes() {
+    const ativa = await this.salgaderiaService.getConfig('whatsapp_session_id');
+    const sessoes = await this.whatsappService.getSessions();
+    return { ativa, sessoes };
+  }
+
+  @Put('sessao-ativa')
+  definirSessaoAtiva(@Body() body: { sessionId: string }) {
+    return this.salgaderiaService.updateConfig('whatsapp_session_id', body.sessionId);
+  }
+
   @Post('lembretes/executar')
   async executarLembretes() {
     const pedidos = await this.salgaderiaService.buscarPedidosParaLembrete();
@@ -115,10 +87,10 @@ export class SalgaderiaController {
           `${pedido.tipo_entrega === 'entrega' ? `🚗 Entrega em: ${pedido.endereco}` : '🏪 Retirada no local'}\n\n` +
           `Qualquer dúvida, é só chamar! 😊`;
 
-        await this.evolutionApi.sendText(pedido.phone, msg);
+        await this.salgaderiaService.enviarMensagemPelaSessaoAtiva(pedido.phone, msg);
         await this.salgaderiaService.marcarLembreteClienteEnviado(pedido.id);
         resultados.push({ pedidoId: pedido.id, ok: true });
-      } catch (e) {
+      } catch (e: any) {
         resultados.push({ pedidoId: pedido.id, ok: false, erro: e.message });
       }
     }
@@ -126,7 +98,6 @@ export class SalgaderiaController {
     return { enviados: resultados.length, resultados };
   }
 
-  // ─── Teste: simula mensagem sem precisar do WhatsApp ─────────────
   @Post('simular')
   async simularMensagem(@Body() body: { phone: string; text: string }) {
     const { resposta, handoff, pedidoConfirmado } = await this.salgaderiaService.processarMensagem(

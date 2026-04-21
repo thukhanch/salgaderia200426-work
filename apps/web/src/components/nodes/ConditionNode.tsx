@@ -1,4 +1,4 @@
-import { NodeProps } from '@xyflow/react';
+import type { NodeProps } from '@xyflow/react';
 import { BaseNode } from './BaseNode';
 
 export function ConditionNode({ data }: NodeProps) {

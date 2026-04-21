@@ -6,9 +6,9 @@ import {
   Controls,
   MiniMap,
   addEdge,
-  Connection,
   BackgroundVariant,
 } from '@xyflow/react';
+import type { Connection } from '@xyflow/react';
 import '@xyflow/react/dist/style.css';
 import { useWorkflowStore } from '../store/workflowStore';
 import { NodeSidebar } from '../components/NodeSidebar';

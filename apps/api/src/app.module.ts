@@ -15,7 +15,7 @@ import { SalgaderiaModule } from './modules/salgaderia/salgaderia.module';
       password: process.env.DB_PASS || 'postgres',
       database: process.env.DB_NAME || 'whatsapp_flow',
       autoLoadEntities: true,
-      synchronize: true,
+      synchronize: false,
     }),
     WhatsappModule,
     WorkflowsModule,
