@@ -1,12 +1,21 @@
 import 'dotenv/config';
 import Fastify from 'fastify';
 import type { Prisma } from '@prisma/client';
-import { connect, setMessageHandler, setMotoboyHandler, setOwnerHandler } from './whatsapp/client';
+import { connect, sendMessage, setMessageHandler, setMotoboyHandler, setOwnerHandler } from './whatsapp/client';
 import { processMessage } from './agent/agent';
 import { prisma } from './db/client';
-import { isMotoboy, processMoboyMessage, invalidateMotoboyCache } from './motoboy/motoboy.service';
+import { isMotoboy, processMotoboyMessage, invalidateMotoboyCache } from './motoboy/motoboy.service';
 import { isOwner, processOwnerCommand } from './admin/admin.service';
 import { getPaymentStatus } from './payment/mercadopago';
+import {
+  GENERAL_CONSTANTS,
+  NUMBER_CONSTANTS,
+  buildConfigurationInProgressMessage,
+  buildMessageTooLongError,
+  buildNoBusinessConfiguredError,
+  isMessageTooLong,
+  normalizePhone,
+} from './config/app.constants';
 
 type BusinessPayload = {
   name: string;
@@ -153,9 +162,13 @@ app.post<{ Body: MotoboyPayload }>('/motoboys', async (req, reply) => {
 });
 
 app.delete<{ Params: { phone: string } }>('/motoboys/:phone', async (req, reply) => {
+  if (!isPhone(req.params.phone)) {
+    return reply.status(400).send({ error: 'phone inválido' });
+  }
+
   const id = await resolveBusinessId();
   await prisma.motoboy.updateMany({
-    where: { businessId: id, phone: req.params.phone },
+    where: { businessId: id, phone: normalizePhone(req.params.phone) },
     data: { active: false },
   });
   invalidateMotoboyCache();
@@ -210,14 +223,6 @@ app.post<{ Body: PaymentWebhookPayload }>('/payment/webhook', async (req, reply)
 
   const order = await prisma.order.findFirst({ where: { paymentId } });
   if (!order) {
-    // Tenta pelo externalRef
-    const orderByRef = await prisma.order.findFirst({ where: { id: { contains: paymentId.slice(-6) } } });
-    if (orderByRef) {
-      await prisma.order.update({
-        where: { id: orderByRef.id },
-        data: { paymentStatus: status, paymentId },
-      });
-    }
     return reply.status(200).send('ok');
   }
 
@@ -235,7 +240,9 @@ app.post<{ Body: SendPayload }>('/send', async (req, reply) => {
   if (!isPhone(phone) || !isNonEmptyString(message)) {
     return reply.status(400).send({ error: 'phone válido e message obrigatórios' });
   }
-  const { sendMessage } = await import('./whatsapp/client');
+  if (isMessageTooLong(message, NUMBER_CONSTANTS.maxMessageLength)) {
+    return reply.status(400).send({ error: buildMessageTooLongError(NUMBER_CONSTANTS.maxMessageLength) });
+  }
   await sendMessage(phone.trim(), message.trim());
   return { sent: true };
 });
@@ -252,7 +259,7 @@ async function main() {
 
   setMessageHandler(async (phone, text) => {
     const bid = await resolveBusinessId();
-    if (!bid) return 'Sistema em configuração. Tente novamente em breve.';
+    if (!bid) return buildConfigurationInProgressMessage();
     return processMessage(phone, text, bid);
   });
 
@@ -274,14 +281,14 @@ async function main() {
   setMotoboyHandler(
     async (phone, text, _bid) => {
       const bid = await resolveBusinessId();
-      if (bid) await processMoboyMessage(phone, text, bid);
+      if (bid) await processMotoboyMessage(phone, text, bid);
     },
     async (phone, _bid) => {
       const bid = await resolveBusinessId();
       if (!bid) return false;
       return isMotoboy(phone, bid);
     },
-    id || '__dynamic__',
+    id || GENERAL_CONSTANTS.dynamicBusinessId,
   );
   console.log('🛵 Sistema de motoboys ativo');
 

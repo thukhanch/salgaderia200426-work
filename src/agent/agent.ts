@@ -3,25 +3,44 @@ import type { ChatCompletionMessageParam } from 'openai/resources';
 import { prisma } from '../db/client';
 import { tools } from './tools/index';
 import { getBusinessInfo } from './tools/business';
-import { createOrder, getOrders, cancelOrder } from './tools/orders';
+import { createOrder } from './tools/orders';
+import { getOrders, cancelOrder } from './tools/orders';
 import { transferToHuman } from './tools/handoff';
+import {
+  AGENT_CONSTANTS,
+  getRequiredEnv,
+  isAssistantToolCallsRole,
+  maskPhone,
+} from '../config/app.constants';
 
-const rawBaseURL = process.env.OPENAI_BASE_URL ?? 'http://localhost:20128';
+const rawBaseURL = getRequiredEnv('OPENAI_BASE_URL');
 const baseURL = rawBaseURL.endsWith('/v1') ? rawBaseURL : `${rawBaseURL.replace(/\/$/, '')}/v1`;
 
 const openai = new OpenAI({
-  apiKey: process.env.OPENAI_API_KEY ?? 'no-key',
+  apiKey: getRequiredEnv('OPENAI_API_KEY'),
   baseURL,
 });
 
-const MODEL = process.env.MODEL_NAME ?? 'gpt-4.5';
-const MAX_HISTORY = 30;
+const MODEL = getRequiredEnv('MODEL_NAME');
+const MAX_HISTORY = AGENT_CONSTANTS.maxHistory;
+const DEFAULT_BUSINESS_NAME = AGENT_CONSTANTS.defaultBusinessName;
 
-// Padrões de prompt injection e manipulação
+const AGENT_MESSAGES = {
+  injectionResponseTemplate: AGENT_CONSTANTS.injectionResponse,
+  invalidCreateOrderArgs: AGENT_CONSTANTS.invalidCreateOrderArgs,
+  unknownTool: AGENT_CONSTANTS.unknownTool,
+  toolExecutionFailure: AGENT_CONSTANTS.toolExecutionFailure,
+  emptyModelResponse: AGENT_CONSTANTS.emptyModelResponse,
+  toolLoopLimitReached: AGENT_CONSTANTS.toolLoopLimitReached,
+  assistantToolCallsRole: AGENT_CONSTANTS.assistantToolCallsRole,
+} as const;
+
 const INJECTION_PATTERNS = [
   /ignore\s+(all\s+)?(previous|prior|above|suas?)\s*(instructions?|instru[çc][õo]es?|regras?)/i,
   /you\s+are\s+now/i,
+  /vo[cç]e\s+agora\s+[ée]/i,
   /novo\s+personagem/i,
+  /(mude|troque|altere)\s+(de\s+)?personagem/i,
   /modo\s+(desenvolvedor|developer|admin|god|irrestrito|sem\s+limites?)/i,
   /act\s+as\s+(if\s+)?you\s+(are|were|have\s+no)/i,
   /pretend\s+(you|to\s+be)/i,
@@ -30,12 +49,110 @@ const INJECTION_PATTERNS = [
   /unlock\s+(your|hidden|secret|true)/i,
   /sem\s+(restri[çc][õo]es?|limites?|regras?)/i,
   /revele?\s+(seu\s+)?(prompt|instru[çc][õo]es?|sistema)/i,
-  /mostre?\s+(seu\s+)?(system\s+prompt|instru[çc][õo]es?\s+internas?)/i,
+  /mostre?\s+(suas?|seu)\s+(system\s+prompt|prompt\s+interno|instru[çc][õo]es?\s+internas?)/i,
+  /(qual|quais)\s+s[aã]o\s+suas\s+instru[çc][õo]es\s+internas/i,
   /what\s+(is\s+your|are\s+your)\s+(system\s+prompt|instructions)/i,
 ];
 
+type CreateOrderToolArgs = {
+  items: Array<{ name: string; quantity: number; unitPrice: number }>;
+  scheduledAt?: string;
+  deliveryType?: 'pickup' | 'delivery';
+  address?: string;
+  notes?: string;
+};
+
 function detectInjection(text: string): boolean {
-  return INJECTION_PATTERNS.some(p => p.test(text));
+  return INJECTION_PATTERNS.some(pattern => pattern.test(text));
+}
+
+function buildInjectionResponse(businessName: string): string {
+  return AGENT_MESSAGES.injectionResponseTemplate.replace(
+    '{{businessName}}',
+    businessName || DEFAULT_BUSINESS_NAME,
+  );
+}
+
+function parseToolArgs(argumentsJson: string | undefined): Record<string, unknown> {
+  if (!argumentsJson) return {};
+  const parsed: unknown = JSON.parse(argumentsJson);
+  if (typeof parsed !== 'object' || parsed === null || Array.isArray(parsed)) {
+    throw new Error('Argumentos da ferramenta inválidos');
+  }
+  return parsed as Record<string, unknown>;
+}
+
+function normalizeFinalContent(content: string | null | undefined): string {
+  return typeof content === 'string' ? content : '';
+}
+
+function getSafeToolResult(error: unknown) {
+  const message = error instanceof Error ? error.message : AGENT_MESSAGES.toolExecutionFailure;
+  return { error: message };
+}
+
+function isCreateOrderToolArgs(args: unknown): args is CreateOrderToolArgs {
+  if (typeof args !== 'object' || args === null) return false;
+  const value = args as Record<string, unknown>;
+  if (!Array.isArray(value.items) || value.items.length === 0) return false;
+  return value.items.every(item => {
+    if (typeof item !== 'object' || item === null) return false;
+    const orderItem = item as Record<string, unknown>;
+    return (
+      typeof orderItem.name === 'string' &&
+      typeof orderItem.quantity === 'number' &&
+      Number.isFinite(orderItem.quantity) &&
+      typeof orderItem.unitPrice === 'number' &&
+      Number.isFinite(orderItem.unitPrice)
+    );
+  });
+}
+
+function validateToolArgs(name: string, args: Record<string, unknown>): string | null {
+  if (name !== 'create_order') return null;
+  return isCreateOrderToolArgs(args) ? null : AGENT_MESSAGES.invalidCreateOrderArgs;
+}
+
+export function isInjectionAttempt(text: string): boolean {
+  return detectInjection(text);
+}
+
+export function getInjectionResponse(businessName = DEFAULT_BUSINESS_NAME): string {
+  return buildInjectionResponse(businessName);
+}
+
+export function simulateAgentGuard(text: string, businessName: string) {
+  return detectInjection(text)
+    ? { blocked: true, response: buildInjectionResponse(businessName) }
+    : { blocked: false, response: null };
+}
+
+export function simulateToolValidation(name: string, argumentsJson: string | undefined) {
+  try {
+    const args = parseToolArgs(argumentsJson);
+    const validationError = validateToolArgs(name, args);
+    return validationError
+      ? { ok: false, result: { error: validationError } }
+      : { ok: true, args };
+  } catch (error) {
+    return { ok: false, result: getSafeToolResult(error) };
+  }
+}
+
+export function simulateCreateOrderArgsValidation(args: unknown): boolean {
+  return isCreateOrderToolArgs(args);
+}
+
+export function simulateToolArgsParsing(argumentsJson: string | undefined): Record<string, unknown> {
+  return parseToolArgs(argumentsJson);
+}
+
+export function simulateFinalContent(content: string | null | undefined): string {
+  return normalizeFinalContent(content);
+}
+
+export function simulateToolError(error: unknown) {
+  return getSafeToolResult(error);
 }
 
 function buildSystemPrompt(business: Awaited<ReturnType<typeof getBusinessInfo>>) {
@@ -178,6 +295,65 @@ async function saveMessage(
   });
 }
 
+function restoreAssistantMessage(content: string): ChatCompletionMessageParam {
+  const toolCalls = JSON.parse(content) as Array<{
+    id: string;
+    type: 'function';
+    function: { name: string; arguments: string };
+  }>;
+  return {
+    role: 'assistant',
+    content: null,
+    tool_calls: toolCalls,
+  } as ChatCompletionMessageParam;
+}
+
+function buildHistory(messages: Array<{
+  role: string;
+  content: string;
+  toolCallId: string | null;
+}>) {
+  return messages.map(message => {
+    if (message.role === 'tool') {
+      return {
+        role: 'tool',
+        tool_call_id: message.toolCallId!,
+        content: message.content,
+      } as ChatCompletionMessageParam;
+    }
+
+    if (isAssistantToolCallsRole(message.role)) {
+      return restoreAssistantMessage(message.content);
+    }
+
+    return {
+      role: message.role as 'user' | 'assistant',
+      content: message.content,
+    } as ChatCompletionMessageParam;
+  });
+}
+
+function getChoiceMessage(response: {
+  choices?: Array<{ message: any; finish_reason?: string | null }>;
+}) {
+  if (!response.choices?.length) {
+    throw new Error(AGENT_MESSAGES.emptyModelResponse);
+  }
+  return response.choices[0];
+}
+
+function buildToolLoopFallback() {
+  return 'Desculpe, não consegui processar sua mensagem. Tente novamente em instantes.';
+}
+
+function logToolLoopLimit(phone: string) {
+  console.warn(`${AGENT_MESSAGES.toolLoopLimitReached} para ${maskPhone(phone)}`);
+}
+
+function logInjectionAttempt(phone: string, text: string) {
+  console.warn(`⚠️  Possível prompt injection detectado de ${maskPhone(phone)}: "${text.slice(0, 100)}"`);
+}
+
 export async function processMessage(phone: string, text: string, businessId: string): Promise<string> {
   const business = await getBusinessInfo(businessId);
   const convo = await getOrCreateConversation(phone, businessId);
@@ -186,20 +362,16 @@ export async function processMessage(phone: string, text: string, businessId: st
     return 'Você está sendo atendido por nossa equipe. Em breve alguém responderá. 🙋';
   }
 
-  // Detecção de prompt injection — loga mas não bloqueia (o prompt já instrui o modelo)
-  if (detectInjection(text)) {
-    console.warn(`⚠️  Possível prompt injection detectado de ${phone}: "${text.slice(0, 100)}"`);
-  }
-
   await saveMessage(convo.id, 'user', text);
 
-  const history: ChatCompletionMessageParam[] = convo.messages.map(m => {
-    if (m.role === 'tool') {
-      return { role: 'tool', tool_call_id: m.toolCallId!, content: m.content } as ChatCompletionMessageParam;
-    }
-    return { role: m.role as 'user' | 'assistant', content: m.content };
-  });
+  if (detectInjection(text)) {
+    logInjectionAttempt(phone, text);
+    const defensiveReply = buildInjectionResponse(business.name);
+    await saveMessage(convo.id, 'assistant', defensiveReply);
+    return defensiveReply;
+  }
 
+  const history: ChatCompletionMessageParam[] = buildHistory(convo.messages);
   history.push({ role: 'user', content: text });
 
   const messages: ChatCompletionMessageParam[] = [
@@ -217,46 +389,53 @@ export async function processMessage(phone: string, text: string, businessId: st
       tool_choice: 'auto',
     });
 
-    const choice = response.choices[0];
+    const choice = getChoiceMessage(response);
     const msg = choice.message;
 
     messages.push(msg as ChatCompletionMessageParam);
 
     if (choice.finish_reason === 'stop' || !msg.tool_calls?.length) {
-      finalContent = msg.content ?? '';
+      finalContent = normalizeFinalContent(msg.content);
       await saveMessage(convo.id, 'assistant', finalContent);
       break;
     }
 
     const assistantContent = JSON.stringify(msg.tool_calls);
-    await saveMessage(convo.id, 'assistant', assistantContent);
+    await saveMessage(convo.id, AGENT_MESSAGES.assistantToolCallsRole, assistantContent);
 
     for (const call of msg.tool_calls) {
-      const args = JSON.parse(call.function.arguments || '{}');
-      let result: any;
+      let args: Record<string, unknown> = {};
+      let result: unknown;
 
       try {
-        switch (call.function.name) {
-          case 'get_business_info':
-            result = business;
-            break;
-          case 'create_order':
-            result = await createOrder({ businessId, phone, ...args });
-            break;
-          case 'get_orders':
-            result = await getOrders(phone, businessId);
-            break;
-          case 'cancel_order':
-            result = await cancelOrder(args.orderId);
-            break;
-          case 'transfer_to_human':
-            result = await transferToHuman(phone, businessId, args.reason);
-            break;
-          default:
-            result = { error: 'Ferramenta desconhecida' };
+        args = parseToolArgs(call.function.arguments);
+        const validationError = validateToolArgs(call.function.name, args);
+
+        if (validationError) {
+          result = { error: validationError };
+        } else {
+          switch (call.function.name) {
+            case 'get_business_info':
+              result = business;
+              break;
+            case 'create_order':
+              result = await createOrder({ businessId, phone, ...(args as CreateOrderToolArgs) });
+              break;
+            case 'get_orders':
+              result = await getOrders(phone, businessId);
+              break;
+            case 'cancel_order':
+              result = await cancelOrder(String(args.orderId ?? ''), phone, businessId);
+              break;
+            case 'transfer_to_human':
+              result = await transferToHuman(phone, businessId, String(args.reason ?? 'Sem motivo informado'));
+              break;
+            default:
+              result = { error: AGENT_MESSAGES.unknownTool };
+          }
         }
-      } catch (err: any) {
-        result = { error: err.message };
+      } catch (error) {
+        result = getSafeToolResult(error);
       }
 
       const resultStr = JSON.stringify(result);
@@ -270,5 +449,9 @@ export async function processMessage(phone: string, text: string, businessId: st
     }
   }
 
-  return finalContent || 'Desculpe, não consegui processar sua mensagem. Tente novamente em instantes.';
+  if (!finalContent) {
+    logToolLoopLimit(phone);
+  }
+
+  return finalContent || buildToolLoopFallback();
 }

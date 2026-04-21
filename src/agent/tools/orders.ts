@@ -1,9 +1,16 @@
 import { prisma } from '../../db/client';
-import { createEvent } from '../../calendar/google';
+import { createEvent, deleteEvent } from '../../calendar/google';
 import { sendMessage } from '../../whatsapp/client';
 import { notifyMotoboys } from '../../motoboy/motoboy.service';
 import { createPaymentLink, isEnabled as mpEnabled } from '../../payment/mercadopago';
 import { printOrder } from '../../printer/printer.service';
+import {
+  NUMBER_CONSTANTS,
+  buildOrderCancellationMessage,
+  buildShortOrderLookupError,
+  isScheduledDateTooFar,
+  matchesOrderShortId,
+} from '../../config/app.constants';
 
 interface OrderItem {
   name: string;
@@ -42,6 +49,9 @@ export async function createOrder(params: CreateOrderParams) {
     const minDate = new Date(Date.now() + 60 * 60 * 1000);
     if (scheduled < minDate) {
       throw new Error('Data de agendamento deve ser pelo menos 1 hora no futuro');
+    }
+    if (isScheduledDateTooFar(scheduled, NUMBER_CONSTANTS.maxScheduledDaysAhead)) {
+      throw new Error(`Data de agendamento deve ser em até ${NUMBER_CONSTANTS.maxScheduledDaysAhead} dias`);
     }
   }
   if (params.deliveryType === 'delivery' && !params.address) {
@@ -183,9 +193,23 @@ export async function getOrders(phone: string, businessId: string) {
   }));
 }
 
-export async function cancelOrder(orderId: string) {
-  const order = await prisma.order.findFirst({ where: { id: { endsWith: orderId } } });
-  if (!order) return { success: false, message: 'Pedido não encontrado' };
+export async function cancelOrder(orderId: string, phone: string, businessId: string) {
+  const normalizedOrderId = orderId.trim().toUpperCase();
+  const orders = await prisma.order.findMany({
+    where: { phone, businessId },
+    orderBy: { createdAt: 'desc' },
+  });
+  const order = orders.find(item => matchesOrderShortId(item.id, normalizedOrderId));
+  if (!order) return { success: false, message: buildShortOrderLookupError() };
+
+  if (order.calendarEventId) {
+    try {
+      await deleteEvent(order.calendarEventId);
+    } catch (error) {
+      console.warn('Google Calendar (cancelamento opcional):', error);
+    }
+  }
+
   await prisma.order.update({ where: { id: order.id }, data: { status: 'cancelled' } });
-  return { success: true, message: `Pedido #${orderId} cancelado` };
+  return { success: true, message: buildOrderCancellationMessage(normalizedOrderId) };
 }

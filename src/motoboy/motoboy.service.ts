@@ -1,14 +1,52 @@
+import { Prisma } from '@prisma/client';
 import { prisma } from '../db/client';
 import { sendMessage } from '../whatsapp/client';
+import {
+  DELIVERY_CONSTANTS,
+  LOG_MESSAGES,
+  MOTOBOY_CONSTANTS,
+  REGEX_CONSTANTS,
+  TIME_CONSTANTS,
+  formatCurrency,
+  formatOrderShortId,
+  getPerBusinessExpiry,
+  joinBulletItems,
+  joinOrderItems,
+  matchesOrderShortId,
+  renderTemplate,
+} from '../config/app.constants';
+
+function isDatabaseUnavailableError(error: unknown) {
+  return error instanceof Prisma.PrismaClientInitializationError;
+}
+
+function getMotoboyUserErrorMessage(error: unknown) {
+  if (isDatabaseUnavailableError(error)) {
+    return 'Banco de dados indisponível no momento. Tente novamente em instantes.';
+  }
+
+  return null;
+}
+
+async function sendSafeMotoboyError(phone: string, error: unknown) {
+  const message = getMotoboyUserErrorMessage(error);
+  if (!message) return;
+  await sendMessage(phone, message);
+}
+
+function logMotoboyError(error: unknown) {
+  console.error(LOG_MESSAGES.motoboyFlowError, error);
+}
 
 // Cache em memória dos telefones de motoboys (evita query no banco a cada mensagem)
-const motoboyPhoneCache = new Map<string, Set<string>>(); // businessId -> Set<phone>
-let cacheExpiry = 0;
-const CACHE_TTL = 60_000; // 1 minuto
+const motoboyPhoneCache = new Map<string, Set<string>>();
+const motoboyCacheExpiry = new Map<string, number>();
+const CACHE_TTL = MOTOBOY_CONSTANTS.cacheTtlMs;
 
 async function getMotoboyPhones(businessId: string): Promise<Set<string>> {
   const now = Date.now();
-  if (now < cacheExpiry && motoboyPhoneCache.has(businessId)) {
+  const businessExpiry = motoboyCacheExpiry.get(businessId) ?? 0;
+  if (now < businessExpiry && motoboyPhoneCache.has(businessId)) {
     return motoboyPhoneCache.get(businessId)!;
   }
 
@@ -19,40 +57,31 @@ async function getMotoboyPhones(businessId: string): Promise<Set<string>> {
 
   const phones = new Set(motoboys.map(m => m.phone));
   motoboyPhoneCache.set(businessId, phones);
-  cacheExpiry = now + CACHE_TTL;
+  motoboyCacheExpiry.set(businessId, getPerBusinessExpiry(now, CACHE_TTL));
   return phones;
 }
 
-export function invalidateMotoboyCache() {
-  motoboyPhoneCache.clear();
-  cacheExpiry = 0;
-}
-
-export async function isMotoboy(phone: string, businessId: string): Promise<boolean> {
-  const phones = await getMotoboyPhones(businessId);
-  return phones.has(phone);
-}
-
 function formatDeliveryAlert(order: any, index?: number, total?: number): string {
-  const items = (order.items as any[]).map(i => `• ${i.quantity}x ${i.name}`).join('\n');
+  const items = joinBulletItems(order.items as Array<{ quantity: number; name: string }>);
+  const shortOrderId = formatOrderShortId(order.id);
   const scheduledAt = order.scheduledAt
-    ? new Date(order.scheduledAt).toLocaleString('pt-BR', { timeZone: 'America/Sao_Paulo' })
-    : 'A combinar';
+    ? new Date(order.scheduledAt).toLocaleString('pt-BR', { timeZone: TIME_CONSTANTS.saoPaulo })
+    : DELIVERY_CONSTANTS.unavailableSchedule;
   const counter = total && total > 1 ? ` (${index}/${total})` : '';
 
   return (
     `🛵 *NOVA ENTREGA DISPONÍVEL${counter}!*\n\n` +
-    `Pedido: #${order.id.slice(-6).toUpperCase()}\n` +
+    `Pedido: #${shortOrderId}\n` +
     `📦 Itens:\n${items}\n\n` +
     `📍 ${order.address}\n` +
     `📅 ${scheduledAt}\n` +
-    `💰 R$ ${Number(order.total).toFixed(2)}\n\n` +
-    `Responda *OK ${order.id.slice(-6).toUpperCase()}* para aceitar.\n` +
+    `💰 ${formatCurrency(Number(order.total))}\n\n` +
+    `Responda *OK ${shortOrderId}* para aceitar.\n` +
     `⚡ Primeiro a responder confirma a corrida!`
   );
 }
 
-export async function notifyMotoboys(order: any): Promise<void> {
+async function doNotifyMotoboys(order: any): Promise<void> {
   const motoboys = await prisma.motoboy.findMany({
     where: { businessId: order.businessId, active: true },
   });
@@ -60,12 +89,13 @@ export async function notifyMotoboys(order: any): Promise<void> {
   if (motoboys.length === 0) {
     console.warn(`⚠️  Nenhum motoboy cadastrado para o negócio ${order.businessId}`);
 
-    // Avisa o dono que não há motoboys
     const business = await prisma.business.findUnique({ where: { id: order.businessId } });
     if (business?.ownerPhone) {
       await sendMessage(
         business.ownerPhone,
-        `⚠️ Pedido #${order.id.slice(-6).toUpperCase()} é uma entrega mas *não há motoboys cadastrados*!\nCadastre motoboys via /motoboys ou atribua manualmente.`,
+        renderTemplate(MOTOBOY_CONSTANTS.noRegisteredMotoboys, {
+          orderId: formatOrderShortId(order.id),
+        }),
       );
     }
     return;
@@ -87,102 +117,58 @@ export async function notifyMotoboys(order: any): Promise<void> {
     data: { motoboyStatus: 'notified' },
   });
 
-  // Timeout: se ninguém aceitar em 5 min, escalona pro dono
   scheduleEscalation(order.id, order.businessId);
 }
 
 function scheduleEscalation(orderId: string, businessId: string) {
-  const TIMEOUT_MS = 5 * 60 * 1000; // 5 minutos
-
   setTimeout(async () => {
-    const order = await prisma.order.findUnique({ where: { id: orderId } });
-    if (!order || order.motoboyStatus !== 'notified') return; // Já foi aceito
+    try {
+      const order = await prisma.order.findUnique({ where: { id: orderId } });
+      if (!order || order.motoboyStatus !== 'notified') return;
 
-    console.warn(`⏰ Pedido #${orderId.slice(-6).toUpperCase()} sem motoboy após 5 min — escalando`);
+      console.warn(`⏰ Pedido #${formatOrderShortId(orderId)} sem motoboy após 5 min — escalando`);
 
-    const business = await prisma.business.findUnique({ where: { id: businessId } });
-    if (business?.ownerPhone) {
-      const items = (order.items as any[]).map(i => `${i.quantity}x ${i.name}`).join(', ');
-      await sendMessage(
-        business.ownerPhone,
-        `⚠️ *Atenção! Nenhum motoboy aceitou a entrega em 5 minutos.*\n\n` +
-          `Pedido: #${orderId.slice(-6).toUpperCase()}\n` +
-          `📦 ${items}\n` +
-          `📍 ${order.address}\n\n` +
-          `Por favor, atribua um motoboy manualmente.`,
-      );
+      const business = await prisma.business.findUnique({ where: { id: businessId } });
+      if (business?.ownerPhone) {
+        const items = joinOrderItems(order.items as Array<{ quantity: number; name: string }>);
+        await sendMessage(
+          business.ownerPhone,
+          renderTemplate(MOTOBOY_CONSTANTS.escalationOwner, {
+            orderId: formatOrderShortId(orderId),
+            items,
+            address: order.address ?? '',
+          }),
+        );
+      }
+    } catch (error) {
+      logMotoboyError(error);
     }
-  }, TIMEOUT_MS);
+  }, MOTOBOY_CONSTANTS.escalationTimeoutMs);
 }
 
-function parseAcceptance(text: string): { accepted: boolean; orderId?: string } {
-  const normalized = text.trim().toLowerCase().replace(/[^\w\s]/g, '');
-  const words = normalized.split(/\s+/);
+async function processPendingMessage(phone: string, businessId: string) {
+  const hasPending = await prisma.order.count({
+    where: { businessId, motoboyStatus: 'notified', deliveryType: 'delivery' },
+  });
 
-  const acceptWords = ['ok', 'sim', 'aceito', 'aceitar', 'pego', 'confirmo', 'quero'];
-  const firstWord = words[0] ?? '';
-
-  if (!acceptWords.includes(firstWord)) {
-    return { accepted: false };
+  if (hasPending > 0) {
+    await sendMessage(phone, renderTemplate(MOTOBOY_CONSTANTS.pendingDeliveries, { count: hasPending }));
   }
-
-  const idPattern = /\b([a-z0-9]{6})\b/i;
-  const match = text.match(idPattern);
-  const orderId = match ? match[1].toUpperCase() : undefined;
-
-  return { accepted: true, orderId };
 }
 
-function parseDeliveryCompletion(text: string): { delivered: boolean; orderId?: string } {
-  const normalized = text.trim();
-  if (!/^entregue\b/i.test(normalized)) {
-    return { delivered: false };
-  }
-
-  const idMatch = normalized.match(/ENTREGUE\s+([A-Z0-9]{6})/i);
-  return {
-    delivered: true,
-    orderId: idMatch ? idMatch[1].toUpperCase() : undefined,
-  };
-}
-
-export async function processMoboyMessage(
-  phone: string,
-  text: string,
-  businessId: string,
-): Promise<void> {
-  const completion = parseDeliveryCompletion(text);
-  if (completion.delivered) {
-    await handleDeliveryComplete(phone, completion.orderId, businessId);
-    return;
-  }
-
-  const { accepted, orderId } = parseAcceptance(text);
-
-  if (!accepted) {
-    const hasPending = await prisma.order.count({
-      where: { businessId, motoboyStatus: 'notified', deliveryType: 'delivery' },
-    });
-    if (hasPending > 0) {
-      await sendMessage(
-        phone,
-        `Há ${hasPending} entrega(s) aguardando. Responda *OK <ID>* para aceitar.\nEx: OK ABC123`,
-      );
-    }
-    return;
-  }
-
+async function processAcceptance(phone: string, businessId: string, orderId?: string) {
   let order: any = null;
 
   if (orderId) {
-    order = await prisma.order.findFirst({
+    const orders = await prisma.order.findMany({
       where: {
         businessId,
         motoboyStatus: 'notified',
         deliveryType: 'delivery',
-        id: { endsWith: orderId.toLowerCase() },
       },
+      orderBy: { createdAt: 'desc' },
     });
+    order = orders.find(item => matchesOrderShortId(item.id, orderId));
   } else {
     order = await prisma.order.findFirst({
       where: { businessId, motoboyStatus: 'notified', deliveryType: 'delivery' },
@@ -191,7 +177,7 @@ export async function processMoboyMessage(
   }
 
   if (!order) {
-    await sendMessage(phone, 'Nenhuma entrega pendente no momento. Aguarde o próximo aviso! 👍');
+    await sendMessage(phone, MOTOBOY_CONSTANTS.noPendingDelivery);
     return;
   }
 
@@ -210,19 +196,21 @@ export async function processMoboyMessage(
   });
 
   if (updated.count === 0) {
-    await sendMessage(phone, '🏃 Essa entrega já foi aceita por outro motoboy. Aguarde o próximo!');
+    await sendMessage(phone, MOTOBOY_CONSTANTS.alreadyAccepted);
     return;
   }
 
-  const items = (order.items as any[]).map(i => `${i.quantity}x ${i.name}`).join(', ');
-  const ordShort = order.id.slice(-6).toUpperCase();
+  const items = joinOrderItems(order.items as Array<{ quantity: number; name: string }>);
+  const ordShort = formatOrderShortId(order.id);
 
   await sendMessage(
     phone,
-    `✅ *Entrega #${ordShort} confirmada para você, ${motoboyName}!*\n\n` +
-      `📦 ${items}\n` +
-      `📍 ${order.address}\n\n` +
-      `Quando concluir, responda *ENTREGUE ${ordShort}*. Boa corrida! 🛵💨`,
+    renderTemplate(MOTOBOY_CONSTANTS.deliveryConfirmed, {
+      orderId: ordShort,
+      motoboyName,
+      items,
+      address: order.address ?? '',
+    }),
   );
 
   const others = await prisma.motoboy.findMany({
@@ -230,40 +218,45 @@ export async function processMoboyMessage(
   });
   for (const other of others) {
     try {
-      await sendMessage(other.phone, `ℹ️ Pedido #${ordShort} foi aceito. Aguarde o próximo!`);
-    } catch {}
+      await sendMessage(other.phone, renderTemplate(MOTOBOY_CONSTANTS.otherMotoboyAccepted, { orderId: ordShort }));
+    } catch (error) {
+      logMotoboyError(error);
+    }
   }
 
   try {
-    await sendMessage(
-      order.phone,
-      `🛵 *Seu pedido saiu para entrega!*\nMotoboy: ${motoboyName}\nChegando em breve! 😊`,
-    );
-  } catch {}
+    await sendMessage(order.phone, renderTemplate(MOTOBOY_CONSTANTS.customerOutForDelivery, { motoboyName }));
+  } catch (error) {
+    logMotoboyError(error);
+  }
 
   try {
     const business = await prisma.business.findUnique({ where: { id: businessId } });
     if (business?.ownerPhone) {
       await sendMessage(
         business.ownerPhone,
-        `🛵 Motoboy *${motoboyName}* aceitou o pedido #${ordShort}.`,
+        renderTemplate(MOTOBOY_CONSTANTS.ownerAccepted, { motoboyName, orderId: ordShort }),
       );
     }
-  } catch {}
+  } catch (error) {
+    logMotoboyError(error);
+  }
 
   console.log(`✅ Entrega #${ordShort} aceita por ${motoboyName}`);
 }
 
 async function handleDeliveryComplete(phone: string, orderId: string | undefined, businessId: string) {
   const order = orderId
-    ? await prisma.order.findFirst({
-        where: {
-          businessId,
-          motoboyPhone: phone,
-          motoboyStatus: 'accepted',
-          id: { endsWith: orderId.toLowerCase() },
-        },
-      })
+    ? (
+        await prisma.order.findMany({
+          where: {
+            businessId,
+            motoboyPhone: phone,
+            motoboyStatus: 'accepted',
+          },
+          orderBy: { updatedAt: 'desc' },
+        })
+      ).find(item => matchesOrderShortId(item.id, orderId)) ?? null
     : await prisma.order.findFirst({
         where: { businessId, motoboyPhone: phone, motoboyStatus: 'accepted' },
         orderBy: { updatedAt: 'desc' },
@@ -273,8 +266,8 @@ async function handleDeliveryComplete(phone: string, orderId: string | undefined
     await sendMessage(
       phone,
       orderId
-        ? `⚠️ Não encontrei uma entrega aceita com o código #${orderId}.`
-        : '⚠️ Você não possui nenhuma entrega aceita para concluir agora.',
+        ? renderTemplate(MOTOBOY_CONSTANTS.completeNotFoundWithId, { orderId })
+        : MOTOBOY_CONSTANTS.completeNotFound,
     );
     return;
   }
@@ -284,10 +277,91 @@ async function handleDeliveryComplete(phone: string, orderId: string | undefined
     data: { motoboyStatus: 'delivered', status: 'delivered' },
   });
 
-  const ordShort = order.id.slice(-6).toUpperCase();
-  await sendMessage(phone, `🎉 Entrega #${ordShort} marcada como concluída! Obrigado!`);
+  const ordShort = formatOrderShortId(order.id);
+  await sendMessage(phone, renderTemplate(MOTOBOY_CONSTANTS.completeSuccess, { orderId: ordShort }));
 
   try {
-    await sendMessage(order.phone, `✅ Entrega confirmada! Obrigado pela preferência. 😊`);
+    await sendMessage(order.phone, MOTOBOY_CONSTANTS.customerDelivered);
   } catch {}
+}
+
+export function invalidateMotoboyCache() {
+  motoboyPhoneCache.clear();
+  motoboyCacheExpiry.clear();
+}
+
+export async function isMotoboy(phone: string, businessId: string): Promise<boolean> {
+  try {
+    const phones = await getMotoboyPhones(businessId);
+    return phones.has(phone);
+  } catch (error) {
+    logMotoboyError(error);
+    return false;
+  }
+}
+
+export async function notifyMotoboys(order: any): Promise<void> {
+  try {
+    await doNotifyMotoboys(order);
+  } catch (error) {
+    logMotoboyError(error);
+    const business = await prisma.business.findUnique({ where: { id: order.businessId } }).catch(() => null);
+    if (business?.ownerPhone) {
+      await sendSafeMotoboyError(business.ownerPhone, error);
+    }
+  }
+}
+
+export function parseAcceptance(text: string): { accepted: boolean; orderId?: string } {
+  const normalized = text.trim().toLowerCase().replace(/[^\w\s]/g, '');
+  const words = normalized.split(/\s+/);
+  const firstWord = words[0] ?? '';
+
+  if (!MOTOBOY_CONSTANTS.acceptWords.includes(firstWord as (typeof MOTOBOY_CONSTANTS.acceptWords)[number])) {
+    return { accepted: false };
+  }
+
+  const rawCandidate = text.trim().split(/\s+/)[1];
+  const orderId = REGEX_CONSTANTS.shortOrderId.test(rawCandidate ?? '') ? rawCandidate!.toUpperCase() : undefined;
+
+  return { accepted: true, orderId };
+}
+
+export function parseDeliveryCompletion(text: string): { delivered: boolean; orderId?: string } {
+  const normalized = text.trim();
+  if (!REGEX_CONSTANTS.deliveredCommand.test(normalized)) {
+    return { delivered: false };
+  }
+
+  const idMatch = normalized.match(REGEX_CONSTANTS.deliveredWithId);
+  return {
+    delivered: true,
+    orderId: idMatch ? idMatch[1].toUpperCase() : undefined,
+  };
+}
+
+export async function processMotoboyMessage(
+  phone: string,
+  text: string,
+  businessId: string,
+): Promise<void> {
+  try {
+    const completion = parseDeliveryCompletion(text);
+    if (completion.delivered) {
+      await handleDeliveryComplete(phone, completion.orderId, businessId);
+      return;
+    }
+
+    const { accepted, orderId } = parseAcceptance(text);
+
+    if (!accepted) {
+      await processPendingMessage(phone, businessId);
+      return;
+    }
+
+    await processAcceptance(phone, businessId, orderId);
+  } catch (error) {
+    logMotoboyError(error);
+    await sendSafeMotoboyError(phone, error);
+  }
 }

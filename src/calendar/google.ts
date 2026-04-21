@@ -1,4 +1,5 @@
 import { google } from 'googleapis';
+import { buildCalendarConfigError } from '../config/app.constants';
 
 interface EventData {
   title: string;
@@ -12,7 +13,13 @@ function getAuth() {
   const raw = process.env.GOOGLE_SERVICE_ACCOUNT_JSON;
   if (!raw) throw new Error('GOOGLE_SERVICE_ACCOUNT_JSON não configurado');
 
-  const credentials = JSON.parse(raw);
+  let credentials: { client_email?: string; private_key?: string };
+  try {
+    credentials = JSON.parse(raw) as { client_email?: string; private_key?: string };
+  } catch {
+    throw new Error(buildCalendarConfigError());
+  }
+
   return new google.auth.JWT(
     credentials.client_email,
     undefined,
