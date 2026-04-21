@@ -19,6 +19,30 @@ interface CreateOrderParams {
 }
 
 export async function createOrder(params: CreateOrderParams) {
+  // Validações de segurança
+  if (!params.items || params.items.length === 0) {
+    throw new Error('Pedido deve ter pelo menos um item');
+  }
+  for (const item of params.items) {
+    if (item.quantity <= 0 || !Number.isFinite(item.quantity)) {
+      throw new Error(`Quantidade inválida para "${item.name}": deve ser maior que zero`);
+    }
+    if (item.quantity > 2000) {
+      throw new Error(`Quantidade de "${item.name}" excede o limite de 2000 unidades por pedido`);
+    }
+    if (item.unitPrice <= 0 || !Number.isFinite(item.unitPrice)) {
+      throw new Error(`Preço inválido para "${item.name}"`);
+    }
+  }
+  if (params.scheduledAt) {
+    const scheduled = new Date(params.scheduledAt);
+    const now = new Date();
+    const minDate = new Date(now.getTime() + 60 * 60 * 1000); // mínimo 1h de antecedência
+    if (scheduled < minDate) {
+      throw new Error('Data de agendamento deve ser pelo menos 1 hora no futuro');
+    }
+  }
+
   const total = params.items.reduce((sum, i) => sum + i.quantity * i.unitPrice, 0);
 
   const order = await prisma.order.create({
