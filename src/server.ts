@@ -6,12 +6,20 @@ import { prisma } from './db/client';
 
 const app = Fastify({ logger: { level: 'info' } });
 
-const BUSINESS_ID = process.env.BUSINESS_ID ?? '';
+let businessId = process.env.BUSINESS_ID ?? '';
 
-// Health check
+async function resolveBusinessId(): Promise<string> {
+  if (businessId) return businessId;
+  const business = await prisma.business.findFirst({ where: { active: true } });
+  if (business) {
+    businessId = business.id;
+    console.log(`✅ Negócio detectado automaticamente: "${business.name}" (${business.id})`);
+  }
+  return businessId;
+}
+
 app.get('/health', async () => ({ status: 'ok', timestamp: new Date().toISOString() }));
 
-// Endpoint para enviar mensagem manualmente (testes)
 app.post<{ Body: { phone: string; message: string } }>('/send', async (req, reply) => {
   const { phone, message } = req.body;
   if (!phone || !message) return reply.status(400).send({ error: 'phone e message obrigatórios' });
@@ -20,51 +28,55 @@ app.post<{ Body: { phone: string; message: string } }>('/send', async (req, repl
   return { sent: true };
 });
 
-// Endpoint para registrar/atualizar negócio
 app.post<{ Body: any }>('/business', async (req, reply) => {
   const { name, ownerPhone, description, hours, menu, config } = req.body;
   if (!name || !ownerPhone) return reply.status(400).send({ error: 'name e ownerPhone obrigatórios' });
 
+  const id = await resolveBusinessId();
   const business = await prisma.business.upsert({
-    where: { id: BUSINESS_ID || 'placeholder' },
+    where: { id: id || 'placeholder' },
     create: { name, ownerPhone, description, hours: hours ?? {}, menu: menu ?? [], config: config ?? {} },
     update: { name, ownerPhone, description, hours, menu, config },
   });
 
+  businessId = business.id;
+  console.log(`✅ Negócio configurado: "${business.name}" (${business.id})`);
   return business;
 });
 
-// Endpoint para ver pedidos
 app.get<{ Querystring: { phone?: string } }>('/orders', async (req) => {
+  const id = await resolveBusinessId();
   const { phone } = req.query;
   return prisma.order.findMany({
-    where: { businessId: BUSINESS_ID, ...(phone ? { phone } : {}) },
+    where: { businessId: id, ...(phone ? { phone } : {}) },
     orderBy: { createdAt: 'desc' },
     take: 50,
   });
 });
 
-// Endpoint para ver conversas
 app.get('/conversations', async () => {
+  const id = await resolveBusinessId();
   return prisma.conversation.findMany({
-    where: { businessId: BUSINESS_ID },
+    where: { businessId: id },
     include: { messages: { orderBy: { createdAt: 'desc' }, take: 1 } },
     orderBy: { updatedAt: 'desc' },
   });
 });
 
 async function main() {
-  if (!BUSINESS_ID) {
-    console.warn('⚠️  BUSINESS_ID não configurado. Configure via POST /business e adicione ao .env');
+  await app.listen({ port: Number(process.env.PORT ?? 3000), host: '0.0.0.0' });
+  console.log(`🚀 Servidor rodando na porta ${process.env.PORT ?? 3000}`);
+
+  const id = await resolveBusinessId();
+  if (!id) {
+    console.warn('⚠️  Nenhum negócio cadastrado. Faça POST /business para configurar.');
   }
 
   setMessageHandler(async (phone: string, text: string) => {
-    if (!BUSINESS_ID) return 'Sistema em configuração. Tente novamente em breve.';
-    return processMessage(phone, text, BUSINESS_ID);
+    const bid = await resolveBusinessId();
+    if (!bid) return 'Sistema em configuração. Tente novamente em breve.';
+    return processMessage(phone, text, bid);
   });
-
-  await app.listen({ port: Number(process.env.PORT ?? 3000), host: '0.0.0.0' });
-  console.log(`🚀 Servidor rodando na porta ${process.env.PORT ?? 3000}`);
 
   console.log('📲 Iniciando WhatsApp...');
   await connect();
